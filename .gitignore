@@ -1,3 +1,5 @@
 venv
 relay-aws.pem
 notes.txt
+__pycache__
+aliases.json
