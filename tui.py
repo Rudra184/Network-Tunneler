@@ -1,3 +1,4 @@
+
 #!/usr/bin/env python3
 """
 tui.py — Secure Tunnel TUI
@@ -5,10 +6,26 @@ tui.py — Secure Tunnel TUI
   python3 tui.py
 """
 
-import asyncio, os, sys, argparse, base64, logging
+import asyncio, os, sys, argparse, base64, logging, time, platform
 from collections import defaultdict
 from urllib.parse import urlparse
 from datetime import datetime
+
+# ── Windows: force UTF-8 console so Unicode chars don't crash CMD ─────────────
+if platform.system().lower() == "windows":
+    import ctypes
+    try:
+        ctypes.windll.kernel32.SetConsoleOutputCP(65001)  # CP_UTF8
+    except Exception:
+        pass
+    try:
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+        sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
+    # NOTE: ProactorEventLoop is the Windows default since Python 3.8.
+    # asyncio.set_event_loop_policy(WindowsProactorEventLoopPolicy()) is
+    # deprecated in 3.12 and removed in 3.16 — no call needed here.
 
 try:
     from textual.app import App, ComposeResult
@@ -16,8 +33,7 @@ try:
     from textual.containers import Container, Horizontal, Vertical, ScrollableContainer, VerticalScroll
     from textual.widgets import (
         Header, Footer, TabbedContent, TabPane,
-        Label, Input, Button, Switch,
-        Static, Select, Rule, RichLog
+        Label, Input, Button, Switch, Static, Select, Rule, RichLog
     )
     from textual.reactive import reactive
     from textual.screen import ModalScreen
@@ -28,16 +44,18 @@ except ImportError:
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 try:
-    from client import (RelayClient, start_tor, stop_tor, TOR_PORT, load_aliases, save_aliases)
+    from client import (RelayClient, start_tor, stop_tor, TOR_PORT,
+                        load_aliases, save_aliases, steg_decode, STEG_RECV_DIR)
     _ok = True
 except ImportError as e:
     _ok = False; _err = str(e)
 
 logging.disable(logging.CRITICAL)
+log = logging.getLogger("tui")
 _PEER_BTN_PREFIX = "PEERBTN__"
 
 
-# ── Custom messages ───────────────────────────────────────────────────────────
+# ── Messages ──────────────────────────────────────────────────────────────────
 
 class IncomingChat(Message):
     def __init__(self, peer_id, from_name, text):
@@ -45,16 +63,26 @@ class IncomingChat(Message):
         self.peer_id = peer_id; self.from_name = from_name; self.text = text
 
 class XferLog(Message):
-    """A line to write to the Files tab transfer log."""
-    def __init__(self, line, is_steg=False):
-        super().__init__()
-        self.line = line; self.is_steg = is_steg
+    def __init__(self, line):
+        super().__init__(); self.line = line
 
 class ShowAcceptModal(Message):
-    def __init__(self, from_name, filename, size_str, tid, future):
+    """Posted from an asyncio Task to ask Textual to show the accept dialog.
+
+    Uses a plain callback + asyncio.Event instead of asyncio.Future so that
+    asyncio.wait_for timeout/cancellation can never corrupt the result.
+    The callback is always called exactly once (Accept → True, anything else → False).
+    """
+    def __init__(self, from_name, filename, size_str, tid, callback):
         super().__init__()
         self.from_name = from_name; self.filename = filename
-        self.size_str  = size_str;  self.tid      = tid; self.future = future
+        self.size_str  = size_str;  self.tid = tid; self.callback = callback
+
+class StegoSaved(Message):
+    """Posted when a received stego PNG has been saved to disk."""
+    def __init__(self, saved_path, from_name, size):
+        super().__init__()
+        self.saved_path = saved_path; self.from_name = from_name; self.size = size
 
 
 # ── Accept modal ──────────────────────────────────────────────────────────────
@@ -62,7 +90,7 @@ class ShowAcceptModal(Message):
 class AcceptModal(ModalScreen):
     CSS = """
     AcceptModal { align: center middle; }
-    #dlg { width: 62; height: auto; padding: 1 2; border: thick $accent; background: $surface; }
+    #dlg { width: 64; height: auto; padding: 1 2; border: thick $accent; background: $surface; }
     #dlg-title { text-style: bold; color: $accent; margin-bottom: 1; }
     #dlg-btns  { margin-top: 1; align: center middle; }
     #b-yes     { margin-right: 2; }
@@ -99,8 +127,11 @@ class TunnelApp(App):
     SUB_TITLE = "E2E Encrypted  •  Port Knock  •  Steganography"
 
     CSS = """
-    .muted { color: $text-muted; }
-    .card-title { text-style: bold; color: $accent; margin-bottom: 1; }
+    .muted       { color: $text-muted; }
+    .card-title  { text-style: bold; color: $accent; margin-bottom: 1; }
+    .sec-encode  { text-style: bold; color: $success; margin-bottom: 1; }
+    .sec-decode  { text-style: bold; color: $warning; margin-bottom: 1; }
+
     #root { layout: horizontal; height: 1fr; }
     #sidebar { width: 22; height: 1fr; border-right: solid $accent; layout: vertical; padding: 0 1; background: $surface; }
     #sb-title { text-style: bold; color: $accent; height: 3; padding-left: 1; content-align: left middle; border-bottom: solid $accent; }
@@ -112,6 +143,7 @@ class TunnelApp(App):
     #myid-box { height: 4; border-top: solid $accent; padding: 1 0 0 0; }
     #myid-val { color: $success; text-style: bold; }
     #statusbar { height: 1; dock: bottom; background: $panel; padding: 0 2; color: $text-muted; }
+
     #stg-scroll { height: 1fr; padding: 1 2; }
     .card  { border: solid $panel; padding: 1 2; margin-bottom: 1; height: auto; }
     .field         { layout: vertical; height: auto; margin-bottom: 1; }
@@ -124,12 +156,14 @@ class TunnelApp(App):
     #btn-connect { margin-right: 1; }
     #stg-msg     { height: 2; margin-top: 1; color: $success; }
     #stg-msg.err { color: $error; }
+
     #chat-wrap { height: 1fr; layout: vertical; padding: 1; }
     #chat-who  { height: 2; color: $text-muted; text-style: italic; }
     #chat-log  { height: 1fr; border: solid $panel; padding: 0 1; }
     #chat-row  { layout: horizontal; height: 3; margin-top: 1; }
     #chat-inp  { width: 1fr; }
     #btn-csend { width: 10; margin-left: 1; }
+
     #files-wrap { height: 1fr; layout: horizontal; }
     #f-left     { width: 30; height: 1fr; border-right: solid $panel; padding: 1; layout: vertical; }
     #f-right    { width: 1fr; height: 1fr; padding: 1; layout: vertical; }
@@ -138,15 +172,25 @@ class TunnelApp(App):
     #f-to       { height: 2; color: $text-muted; }
     #btn-fsend  { margin-top: 1; }
     #xfer-log   { height: 1fr; border: solid $panel; padding: 0 1; }
+
     #steg-scroll    { height: 1fr; padding: 1 2; }
-    #steg-info      { border: solid $panel; padding: 1; margin-bottom: 1; color: $text-muted; text-style: italic; height: auto; }
-    .st-field           { layout: vertical; height: auto; margin-bottom: 1; }
-    .st-field > Label   { height: 1; color: $text-muted; }
-    .st-field > Input   { height: 3; }
-    #steg-sel { height: 3; margin-bottom: 1; }
-    #steg-to  { height: 2; color: $text-muted; }
-    #btn-steg { margin-top: 1; }
-    #steg-out { height: 2; margin-top: 1; }
+    #enc-card       { border: solid $success; padding: 1 2; margin-bottom: 1; height: auto; }
+    .ef             { layout: vertical; height: auto; margin-bottom: 1; }
+    .ef > Label     { height: 1; color: $text-muted; }
+    .ef > Input     { height: 3; }
+    #enc-sel        { height: 3; margin-bottom: 1; }
+    #enc-to         { height: 2; color: $text-muted; margin-bottom: 1; }
+    #btn-encode     { margin-top: 1; }
+    #enc-status     { height: 2; margin-top: 1; }
+    #dec-card       { border: solid $warning; padding: 1 2; margin-bottom: 1; height: auto; }
+    #dec-recv-dir   { height: 3; color: $success; text-style: italic; margin-bottom: 1; }
+    .df             { layout: vertical; height: auto; margin-bottom: 1; }
+    .df > Label     { height: 1; color: $text-muted; }
+    .df > Input     { height: 3; }
+    #btn-decode     { margin-top: 1; }
+    #dec-status     { height: 2; margin-top: 1; }
+    #dec-result     { height: 8; border: solid $panel; padding: 0 1; margin-top: 1; }
+
     #peers-wrap    { height: 1fr; layout: vertical; padding: 1; }
     #peers-log     { height: 1fr; border: solid $panel; padding: 0 1; }
     #alias-section { height: 20; border-top: solid $panel; padding: 1; margin-top: 1; layout: vertical; }
@@ -173,11 +217,13 @@ class TunnelApp(App):
         self._client      = None; self._tor_managed = False
         self._chat_logs   = defaultdict(list); self._aliases = load_aliases()
         self._msg_task    = None; self._mounted = False; self._shown_peers: dict = {}
-        self._relay       = args.relay;  self._port   = args.port
-        self._secret      = args.secret; self._name   = args.name
-        self._fp          = getattr(args,"fingerprint","");  self._knock = getattr(args,"knock_ports","")
-        self._use_tor     = getattr(args,"tor",False);       self._proxy = getattr(args,"proxy","")
-        self._use_steg    = getattr(args,"steg",False);      self._auto_accept = getattr(args,"auto_accept",False)
+        self._relay       = args.relay;  self._port        = args.port
+        self._secret      = args.secret; self._name        = args.name
+        self._fp          = getattr(args,"fingerprint","")
+        self._knock       = getattr(args,"knock_ports","")
+        self._use_tor     = getattr(args,"tor",False)
+        self._proxy       = getattr(args,"proxy","")
+        self._auto_accept = getattr(args,"auto_accept",False)
 
     def compose(self) -> ComposeResult:
         yield Header(show_clock=True)
@@ -187,49 +233,53 @@ class TunnelApp(App):
                 with VerticalScroll(id="peer-scroll"):
                     yield Label("(not connected)", id="no-peers", classes="muted")
                 with Vertical(id="myid-box"):
-                    yield Label("Your ID", classes="muted"); yield Label("—", id="myid-val")
+                    yield Label("Your ID", classes="muted")
+                    yield Label("—", id="myid-val")
 
             with TabbedContent(id="tabs", initial="tab-settings"):
 
                 with TabPane("⚙ Settings", id="tab-settings"):
                     with ScrollableContainer(id="stg-scroll"):
-                        yield Static("👋  Fill in your details and click Connect. All settings can be changed without restarting.", classes="muted")
+                        yield Static("👋  Fill in details and click Connect.", classes="muted")
                         yield Rule()
                         with Vertical(classes="card"):
                             yield Label("🔌  Connection", classes="card-title")
                             with Vertical(classes="field"):
-                                yield Label("Relay server IP"); yield Input(value=self._relay, placeholder="e.g. 100.31.6.224", id="i-relay")
+                                yield Label("Relay server IP")
+                                yield Input(value=self._relay, placeholder="e.g. 100.31.6.224", id="i-relay")
                             with Vertical(classes="field"):
-                                yield Label("Port"); yield Input(value=str(self._port), placeholder="4001", id="i-port")
+                                yield Label("Port")
+                                yield Input(value=str(self._port), placeholder="4001", id="i-port")
                             with Vertical(classes="field"):
-                                yield Label("Secret key"); yield Input(value=self._secret, password=True, placeholder="Shared tunnel secret", id="i-secret")
+                                yield Label("Secret key")
+                                yield Input(value=self._secret, password=True, placeholder="Shared tunnel secret", id="i-secret")
                             with Vertical(classes="field"):
-                                yield Label("Your display name"); yield Input(value=self._name, placeholder="e.g. alice", id="i-name")
+                                yield Label("Your display name")
+                                yield Input(value=self._name, placeholder="e.g. alice", id="i-name")
                             with Vertical(classes="field"):
-                                yield Label("TLS Fingerprint  (printed by server on startup)"); yield Input(value=self._fp, placeholder="SHA-256 hex — leave blank to skip pinning", id="i-fp")
+                                yield Label("TLS Fingerprint  (printed by server on startup)")
+                                yield Input(value=self._fp, placeholder="SHA-256 hex — leave blank to skip", id="i-fp")
                         with Vertical(classes="card"):
                             yield Label("🚪  Port Knocking", classes="card-title")
                             with Vertical(classes="field"):
-                                yield Label("Knock sequence  (comma-separated ports)"); yield Input(value=self._knock, placeholder="e.g. 6132,8152,3101", id="i-knock")
-                            yield Static("Client sends TCP SYN to each port in order. knockd opens 4001 for your IP for 30 s. Leave blank to skip.", classes="desc")
+                                yield Label("Knock sequence  (comma-separated)")
+                                yield Input(value=self._knock, placeholder="e.g. 1000, 2000, 3000", id="i-knock")
                         with Vertical(classes="card"):
                             yield Label("🧅  Privacy", classes="card-title")
                             with Horizontal(classes="tog"):
                                 yield Label("Route via Tor"); yield Switch(value=self._use_tor, id="sw-tor")
-                            yield Static("Auto-installs Tor if missing, routes all traffic through it, stops on quit.", classes="desc")
                             with Vertical(classes="field"):
-                                yield Label("Manual SOCKS5 proxy  (ignored when Tor is ON)"); yield Input(value=self._proxy, placeholder="socks5://127.0.0.1:9050", id="i-proxy")
+                                yield Label("Manual SOCKS5 proxy")
+                                yield Input(value=self._proxy, placeholder="socks5://127.0.0.1:9050", id="i-proxy")
                         with Vertical(classes="card"):
                             yield Label("📁  Transfers", classes="card-title")
                             with Horizontal(classes="tog"):
-                                yield Label("Steganography mode"); yield Switch(value=self._use_steg, id="sw-steg")
-                            yield Static("When ON: files sent via Files tab are hidden inside a generated PNG. Use the Steg tab to choose a specific cover image.", classes="desc")
-                            with Horizontal(classes="tog"):
-                                yield Label("Auto-accept incoming files"); yield Switch(value=self._auto_accept, id="sw-aa")
-                            yield Static("When OFF: a popup lets you accept or reject each incoming file.", classes="desc")
+                                yield Label("Auto-accept incoming files")
+                                yield Switch(value=self._auto_accept, id="sw-aa")
+                            yield Static("When OFF: popup lets you accept or reject each transfer.", classes="desc")
                         yield Rule()
                         with Horizontal(id="stg-btns"):
-                            yield Button("⚡  Connect", id="btn-connect", variant="success")
+                            yield Button("⚡  Connect",    id="btn-connect",    variant="success")
                             yield Button("✖  Disconnect", id="btn-disconnect", variant="error")
                         yield Label("", id="stg-msg")
 
@@ -245,50 +295,55 @@ class TunnelApp(App):
                     with Horizontal(id="files-wrap"):
                         with Vertical(id="f-left"):
                             yield Label("Send a file or folder", classes="card-title")
-                            yield Static("Paste the full path below.\nFolders are auto-zipped.\nAll transfers are E2E encrypted.", id="f-hint")
+                            yield Static("Paste the full path below.\nFolders are auto-zipped.", id="f-hint")
                             yield Input(placeholder="/home/user/secret.pdf", id="f-path")
                             yield Label("To: (select peer in sidebar)", id="f-to")
-                            yield Button("⬆  Send to selected peer", id="btn-fsend", variant="primary")
+                            yield Button("⬆  Send", id="btn-fsend", variant="primary")
                         with Vertical(id="f-right"):
-                            yield Label("Transfer log  (sent, received and steg results)", classes="card-title")
+                            yield Label("Transfer log", classes="card-title")
                             yield RichLog(id="xfer-log", auto_scroll=True, markup=True)
 
                 with TabPane("🖼 Steg", id="tab-steg"):
                     with ScrollableContainer(id="steg-scroll"):
-                        yield Label("Steganography — hide data inside an image", classes="card-title")
-                        yield Static(
-                            "How encoding works:\n"
-                            "  1. You pick a cover image (JPG, PNG, BMP, TIFF, WebP …)\n"
-                            "  2. Your file or message is AES-256-GCM encrypted with the shared key\n"
-                            "  3. The ciphertext is embedded into the image's pixel LSBs (±1 per channel)\n"
-                            "  4. The result is sent as a PNG — looks identical to the original\n\n"
-                            "How decoding works (automatic on receiver's side):\n"
-                            "  1. Receiver sees the accept/reject popup — click Accept\n"
-                            "  2. The stego PNG downloads automatically\n"
-                            "  3. LSBs are extracted → AES-GCM decrypted with the shared key\n"
-                            "  4. Hidden FILE → saved to disk, path shown in the Files tab log\n"
-                            "  5. Hidden TEXT → displayed in the Files tab log\n\n"
-                            "Security: Without the shared key, the extracted LSBs look like\n"
-                            "random noise — AES-256 ciphertext is computationally indistinguishable\n"
-                            "from random data.\n\n"
-                            "Requires:  pip install pillow",
-                            id="steg-info"
-                        )
+
+                        yield Label("🔒  ENCODE — hide data inside a cover image", classes="sec-encode")
+                        with Vertical(id="enc-card"):
+                            with Vertical(classes="ef"):
+                                yield Label("Cover image  (JPG, PNG, BMP, TIFF, WebP …)")
+                                yield Input(placeholder="/home/user/photo.jpg", id="enc-cover")
+                            yield Label("What to hide", classes="muted")
+                            yield Select([("Hide a file","file"),("Hide a text message","msg")],
+                                         id="enc-sel", value="file")
+                            with Vertical(classes="ef"):
+                                yield Label("File to hide  (any type: PDF, ZIP, image, doc …)")
+                                yield Input(placeholder="/home/user/document.pdf", id="enc-file")
+                            with Vertical(classes="ef"):
+                                yield Label("Message to hide")
+                                yield Input(placeholder="Type your secret message …", id="enc-msg")
+                            with Vertical(classes="ef"):
+                                yield Label("🔑  Steg password  (tell receiver out-of-band — NEVER transmitted)")
+                                yield Input(placeholder="e.g. correct-horse-battery-staple", id="enc-pass", password=True)
+                            yield Label("To: (select peer in sidebar)", id="enc-to")
+                            yield Button("🖼  Embed & Send", id="btn-encode", variant="success")
+                            yield Label("", id="enc-status")
+
                         yield Rule()
-                        with Vertical(classes="st-field"):
-                            yield Label("Cover image path  (JPG, PNG, BMP, TIFF, WebP …)")
-                            yield Input(placeholder="/home/user/photo.jpg  or  photo.png", id="steg-cover")
-                        yield Label("What to hide", classes="muted")
-                        yield Select([("Hide a file","file"),("Hide a text message","msg")], id="steg-sel", value="file")
-                        with Vertical(classes="st-field"):
-                            yield Label("File to hide  (enter full path)")
-                            yield Input(placeholder="/home/user/document.pdf", id="steg-file")
-                        with Vertical(classes="st-field"):
-                            yield Label("Message to hide  (type it here)")
-                            yield Input(placeholder="Type your secret message …", id="steg-msg-inp")
-                        yield Label("To: (select peer in sidebar)", id="steg-to")
-                        yield Button("🖼  Embed & Send to selected peer", id="btn-steg", variant="primary")
-                        yield Label("", id="steg-out")
+
+                        yield Label("🔓  DECODE — extract hidden data from a stego image", classes="sec-decode")
+                        with Vertical(id="dec-card"):
+                            yield Label(
+                                f"Received stego PNGs are saved to:\n  {STEG_RECV_DIR}",
+                                id="dec-recv-dir"
+                            )
+                            with Vertical(classes="df"):
+                                yield Label("Stego image path  (auto-filled when you receive one)")
+                                yield Input(placeholder=f"{STEG_RECV_DIR}/photo_alice_20250101.steg.png", id="dec-path")
+                            with Vertical(classes="df"):
+                                yield Label("🔑  Steg password  (same one the sender told you)")
+                                yield Input(placeholder="Enter the steg password …", id="dec-pass", password=True)
+                            yield Button("🔓  Decode", id="btn-decode", variant="warning")
+                            yield Label("", id="dec-status")
+                            yield RichLog(id="dec-result", auto_scroll=True, markup=True)
 
                 with TabPane("👥 Peers", id="tab-peers"):
                     with Vertical(id="peers-wrap"):
@@ -296,7 +351,7 @@ class TunnelApp(App):
                         yield RichLog(id="peers-log", auto_scroll=False, markup=True)
                         with Vertical(id="alias-section"):
                             yield Label("Aliases", classes="card-title")
-                            yield Label("Save a short name for a peer ID so you can use it everywhere.", classes="muted")
+                            yield Label("Save a short name for a peer ID.", classes="muted")
                             yield Input(placeholder="Alias name  e.g. bob", id="inp-alias-name")
                             yield Input(placeholder="Peer ID     e.g. a1b2c3d4", id="inp-alias-id")
                             yield Button("💾  Save alias", id="btn-save-alias", variant="primary")
@@ -309,7 +364,8 @@ class TunnelApp(App):
         self._mounted = True; self._draw_alias_log()
         self.set_interval(1.0, self._tick)
         if self._relay and self._secret:
-            asyncio.get_event_loop().call_later(0.4, lambda: asyncio.create_task(self._do_connect()))
+            asyncio.get_event_loop().call_later(
+                0.4, lambda: asyncio.create_task(self._do_connect()))
 
     async def on_unmount(self):
         if self._mounted:
@@ -335,14 +391,65 @@ class TunnelApp(App):
         if xl: xl.write(msg.line)
 
     async def on_show_accept_modal(self, msg: ShowAcceptModal):
-        if msg.future.done(): return
+        """Show the accept/reject dialog and fire the callback with the result.
+
+        push_screen_wait() returns whatever AcceptModal.dismiss() was given:
+          True  → user clicked Accept
+          False → user clicked Reject OR the 30 s auto-timer fired
+          None  → Textual dismissed the screen without a value (treat as reject)
+        The callback is always called exactly once so tui_prompt_accept unblocks.
+        """
         try:
             result = await self.push_screen_wait(
-                AcceptModal(msg.from_name, msg.filename, msg.size_str, msg.tid)
+                AcceptModal(msg.from_name, msg.filename, msg.size_str, msg.tid))
+            msg.callback(result is True)   # None / False → False
+        except Exception as exc:
+            log.warning("on_show_accept_modal error: %s", exc)
+            msg.callback(False)
+
+    def on_stego_saved(self, msg: StegoSaved):
+        """
+        Called when receiver saves a stego PNG to disk.
+
+        Runs in Textual's widget context (Message handler) — safe to touch
+        widgets directly. No call_later or lambda needed.
+
+        The key rule: _go() called directly here works because Message handlers
+        always run inside Textual's event loop context.
+        """
+        ts = datetime.now().strftime("%H:%M")
+
+        # 1. Log in Files tab
+        xl = self._q("#xfer-log", RichLog)
+        if xl:
+            xl.write(
+                f"[{ts}] [bold magenta]🖼 STEG PNG received[/bold magenta] "
+                f"from [cyan]{msg.from_name}[/cyan]  ({msg.size} bytes)\n"
+                f"  Saved → [bold]{msg.saved_path}[/bold]\n"
+                f"  → Go to Steg tab (F4) → DECODE → enter password"
             )
-            msg.future.set_result(bool(result))
-        except Exception:
-            if not msg.future.done(): msg.future.set_result(False)
+
+        # 2. Auto-fill the decode path field
+        dec = self._q("#dec-path", Input)
+        if dec: dec.value = msg.saved_path
+
+        # 3. Show instruction in decode status
+        ds = self._q("#dec-status", Label)
+        if ds:
+            ds.update(
+                f"[bold cyan]Stego PNG received from {msg.from_name}![/bold cyan]  "
+                f"Enter the password above and click Decode."
+            )
+
+        # 4. Write to decode result log
+        dr = self._q("#dec-result", RichLog)
+        if dr:
+            dr.clear()
+            dr.write(f"[bold yellow]Ready to decode:[/bold yellow]  {msg.saved_path}")
+            dr.write("[dim]Enter the steg password the sender told you, then click Decode.[/dim]")
+
+        # 5. Switch to Steg tab — direct call works here (Message handler context)
+        self._go("tab-steg")
 
     # ── tick ──────────────────────────────────────────────────
 
@@ -355,8 +462,8 @@ class TunnelApp(App):
     async def _update_sidebar(self):
         if not self._client: return
         current = dict(self._client.peers)
-        id2al   = {v: k for k, v in self._aliases.items()}
-        desired: dict[str, str] = {}
+        id2al   = {v:k for k,v in self._aliases.items()}
+        desired: dict[str,str] = {}
         for pid, pname in current.items():
             al = id2al.get(pid,"")
             desired[pid] = f"● {pname}" + (f" ({al})" if al else "")
@@ -409,11 +516,9 @@ class TunnelApp(App):
                 al    = {v:k for k,v in self._aliases.items()}.get(pid,"")
                 w.update(f"Chatting with [bold]{pname}[/bold] [{pid}]" + (f"  alias:{al}" if al else ""))
                 self._restore_chat(pid)
-                sb = self._q("#statusbar", Label)
-                if sb: sb.update(f"⬡  Selected: {pname} [{pid}]  — type and press Send")
             else: w.update("← Click a peer in the sidebar to chat")
         txt = self._peer_display()
-        for sel in ("#f-to","#steg-to"):
+        for sel in ("#f-to","#enc-to"):
             lbl = self._q(sel, Label)
             if lbl: lbl.update(f"To: [bold]{txt}[/bold]" if pid else "To: (select peer in sidebar)")
 
@@ -435,7 +540,8 @@ class TunnelApp(App):
         elif bid == "btn-disconnect": await self._disconnect()
         elif bid == "btn-csend":      await self._send_chat()
         elif bid == "btn-fsend":      await self._send_file()
-        elif bid == "btn-steg":       await self._send_steg()
+        elif bid == "btn-encode":     await self._send_steg()
+        elif bid == "btn-decode":     await self._decode_steg()
         elif bid == "btn-save-alias": self._save_alias()
 
     async def on_input_submitted(self, e):
@@ -445,8 +551,7 @@ class TunnelApp(App):
         self._relay = self._val("#i-relay"); self._secret = self._val("#i-secret")
         self._name  = self._val("#i-name") or "peer"; self._fp = self._val("#i-fp")
         self._knock = self._val("#i-knock"); self._proxy = self._val("#i-proxy")
-        self._use_tor = self._sw("#sw-tor"); self._use_steg = self._sw("#sw-steg")
-        self._auto_accept = self._sw("#sw-aa")
+        self._use_tor = self._sw("#sw-tor"); self._auto_accept = self._sw("#sw-aa")
         try:    self._port = int(self._val("#i-port") or "4001")
         except: self._port = 4001
 
@@ -462,16 +567,18 @@ class TunnelApp(App):
         if not self._relay: self._stg_msg("Relay IP is required", err=True); return
         if not self._secret: self._stg_msg("Secret key is required", err=True); return
         self._stg_msg("Connecting …")
+
         if self._use_tor and not self._tor_managed:
-            self._stg_msg("Starting Tor (up to 60 s) …")
             try:
                 await asyncio.get_event_loop().run_in_executor(None, start_tor)
                 self._tor_managed = True
             except Exception as ex:
                 self._stg_msg(f"Tor failed: {ex} — connecting directly", err=True)
+
         proxy = None
         if self._use_tor: proxy = urlparse(f"socks5://127.0.0.1:{TOR_PORT}")
         elif self._proxy: proxy = urlparse(self._proxy)
+
         knock_ports = []
         if self._knock:
             try:    knock_ports = list(map(int, self._knock.split(",")))
@@ -480,12 +587,12 @@ class TunnelApp(App):
         self._client = RelayClient(
             host=self._relay, port=self._port, name=self._name, secret=self._secret,
             fingerprint=self._fp or None, proxy=proxy,
-            use_steg=self._use_steg, knock_ports=knock_ports, auto_accept=self._auto_accept,
+            knock_ports=knock_ports, auto_accept=self._auto_accept,
         )
 
         app_ref = self
 
-        # ── Transfer accept modal bridge ───────────────────────────────────────
+        # ── Hook 1: Accept prompt (shows TUI modal) ───────────────────────────
         async def tui_prompt_accept(tid, from_name, filename, size_bytes):
             if app_ref._auto_accept: return True
             size_str = (
@@ -493,46 +600,45 @@ class TunnelApp(App):
                 else f"{size_bytes//1024} KB"       if size_bytes > 1024
                 else f"{size_bytes} B"
             )
-            loop   = asyncio.get_event_loop()
-            future = loop.create_future()
-            app_ref.post_message(ShowAcceptModal(from_name, filename, size_str, tid, future))
-            try:    return await asyncio.wait_for(future, timeout=35)
-            except: return False
 
-        self._client._prompt_accept = tui_prompt_accept
+            # Use asyncio.Event + a mutable result holder instead of asyncio.Future.
+            # Future.cancel() (called by asyncio.wait_for on timeout in Python 3.12+)
+            # puts the Future into a cancelled state, which makes set_result() raise
+            # InvalidStateError in on_show_accept_modal — silently resolving to False
+            # even when the user just clicked Accept a millisecond after the timeout.
+            # asyncio.Event has no such cancellation semantics.
+            accepted_event  = asyncio.Event()
+            accepted_result = [False]          # list so the nested callback can mutate it
 
-        # ── Steg result callback ───────────────────────────────────────────────
-        # Called by _receive_file after successful steg extraction.
-        # Routes the result to the Files tab log so user knows where the file is.
-        def on_steg_received(saved_path, size, from_name, steg_type, message_text=None):
-            ts = datetime.now().strftime("%H:%M")
-            if steg_type == "msg":
-                line = (
-                    f"[{ts}] [bold magenta]🖼 STEG MSG[/bold magenta] "
-                    f"from [cyan]{from_name}[/cyan]:\n"
-                    f"  [italic]\"{message_text}\"[/italic]"
-                )
-            else:
-                line = (
-                    f"[{ts}] [bold magenta]🖼 STEG FILE[/bold magenta] "
-                    f"from [cyan]{from_name}[/cyan]  "
-                    f"([green]{size} bytes[/green])\n"
-                    f"  Saved → [bold]{saved_path}[/bold]"
-                )
-            app_ref.post_message(XferLog(line, is_steg=True))
-            # Switch to Files tab so user sees it immediately
-            app_ref.call_later(lambda: app_ref._go("tab-files"))
+            def _on_modal_done(accepted: bool):
+                accepted_result[0] = accepted
+                accepted_event.set()           # unblocks the await below
 
-        self._client._on_steg_received = on_steg_received
+            app_ref.post_message(ShowAcceptModal(from_name, filename, size_str, tid, _on_modal_done))
+            try:
+                # 35 s is longer than the modal's own 30 s auto-reject timer,
+                # so in practice this timeout is just a safety net.
+                await asyncio.wait_for(accepted_event.wait(), timeout=35)
+            except asyncio.TimeoutError:
+                pass   # accepted_result[0] stays False
+            return accepted_result[0]
 
-        # ── xfer status callback ───────────────────────────────────────────────
+        # ── Hook 2: Stego saved (auto-fill decode path, switch tab) ──────────
+        # Set BEFORE connect() so it's ready even if a transfer arrives immediately
+        def on_stego_saved(saved_path, from_name, size):
+            # post_message is safe from any async context
+            app_ref.post_message(StegoSaved(saved_path, from_name, size))
+
+        # ── Hook 3: Transfer status lines (shown in Files log) ────────────────
         def on_xfer_status(msg_str, is_err):
-            ts   = datetime.now().strftime("%H:%M")
-            col  = "red" if is_err else "green"
-            line = f"[{ts}] [{col}]{msg_str}[/{col}]"
-            app_ref.post_message(XferLog(line))
+            ts  = datetime.now().strftime("%H:%M")
+            col = "red" if is_err else "green"
+            app_ref.post_message(XferLog(f"[{ts}] [{col}]{msg_str}[/{col}]"))
 
-        self._client._on_xfer_status = on_xfer_status
+        # Set all hooks BEFORE connect() — this is critical
+        self._client._prompt_accept    = tui_prompt_accept
+        self._client._on_stego_saved   = on_stego_saved
+        self._client._on_xfer_status   = on_xfer_status
 
         try:
             await self._client.connect()
@@ -542,7 +648,7 @@ class TunnelApp(App):
         self.connected = True
         w = self._q("#myid-val", Label)
         if w: w.update(self._client.my_id or "—")
-        self._stg_msg(f"Connected ✓  id = {self._client.my_id}  — click a peer in the sidebar")
+        self._stg_msg(f"Connected ✓  id = {self._client.my_id}")
         self._msg_task = asyncio.create_task(self._intercept_callbacks())
 
     async def _disconnect(self):
@@ -565,12 +671,11 @@ class TunnelApp(App):
         np = self._q("#no-peers", Label)
         if np: np.update("(not connected)"); np.display = True
 
-    # ── intercept client callbacks ────────────────────────────
-
     async def _intercept_callbacks(self):
         """
-        Replace _receive_message and _receive_file with TUI-aware versions.
-        Uses post_message (safe from any async context) to route to the UI.
+        Replace _receive_message with a TUI-aware version that posts IncomingChat.
+        For files: the original _receive_file already uses _on_stego_saved and
+        _on_xfer_status hooks, so we just add a log line for normal files.
         """
         if not self._client: return
         orig_msg  = self._client._receive_message
@@ -592,17 +697,18 @@ class TunnelApp(App):
             await orig_msg(msg)
 
         async def intercept_file(meta):
-            # orig_file handles: accept prompt, download, steg extract, save
-            # _on_steg_received and _on_xfer_status callbacks post messages to TUI
+            # orig_file handles steg save + _on_stego_saved + _on_xfer_status
             await orig_file(meta)
-            # For normal (non-steg) files, add a log line here
+            # Only add a Files-tab log line for normal (non-steg) files
+            # Steg files are logged via the _on_xfer_status hook
             if not meta.get("steg", False):
                 from_name = meta.get("from_name","?")
                 fname     = meta.get("display_name","file")
                 size      = meta.get("size",0)
                 ts        = datetime.now().strftime("%H:%M")
-                line = f"[{ts}] [cyan]↓ {from_name}[/cyan]: [bold]{fname}[/bold]  ({size} B)"
-                app_ref.post_message(XferLog(line))
+                app_ref.post_message(XferLog(
+                    f"[{ts}] [cyan]↓ {from_name}[/cyan]: [bold]{fname}[/bold]  ({size} B)"
+                ))
 
         self._client._receive_message = intercept_msg
         self._client._receive_file    = intercept_file
@@ -650,44 +756,102 @@ class TunnelApp(App):
         except Exception as ex:
             if xl: xl.write(f"[red]✗ {ex}[/red]")
 
-    # ── steg send ─────────────────────────────────────────────
+    # ── steg ENCODE ───────────────────────────────────────────
 
     async def _send_steg(self):
         if not self._check_ready(): return
-        cover = self._val("#steg-cover")
-        sel_w = self._q("#steg-sel", Select)
-        mode  = sel_w.value if sel_w else "file"
-        out   = self._q("#steg-out", Label)
+        cover    = self._val("#enc-cover")
+        sel_w    = self._q("#enc-sel", Select)
+        mode     = sel_w.value if sel_w else "file"
+        password = self._val("#enc-pass")
+        st_lbl   = self._q("#enc-status", Label)
 
         def st(m, err=False):
-            if out: out.update(("[red]" if err else "") + m + ("[/red]" if err else ""))
+            if st_lbl: st_lbl.update(("[red]" if err else "[cyan]") + m + ("[/red]" if err else "[/cyan]"))
 
-        if not cover:                  st("⚠  Enter a cover image path"); return
-        if not os.path.isfile(cover):  st(f"⚠  Cover not found: {cover}"); return
+        if not cover:                 st("⚠  Enter a cover image path"); return
+        if not os.path.isfile(cover): st(f"⚠  Cover not found: {cover}"); return
+        if not password:              st("⚠  Enter a steg password — receiver needs it to decode"); return
 
         if mode == "file":
-            fp = self._val("#steg-file")
+            fp = self._val("#enc-file")
             if not fp or not os.path.isfile(fp): st("⚠  Enter a valid file path to hide"); return
-            payload = open(fp,"rb").read(); label = os.path.basename(fp)
+            payload = open(fp,"rb").read(); ct = "file"; fn = os.path.basename(fp); label = fn
         else:
-            txt = self._val("#steg-msg-inp")
+            txt = self._val("#enc-msg")
             if not txt: st("⚠  Enter a message to hide"); return
-            payload = txt.encode(); label = "message"
+            payload = txt.encode(); ct = "msg"; fn = ""; label = "message"
 
-        st(f"Encrypting + embedding via Pillow LSB …")
+        st("Encrypting + embedding … (PBKDF2 key derivation, takes a moment)")
         try:
-            await self._client.send_steg(self.selected_peer, cover, payload, label=label)
-            st(f"[green]✓ Sent hidden {label} to {self._peer_display()}[/green]")
+            await self._client.send_steg(self.selected_peer, cover, payload, password,
+                                         content_type=ct, filename=fn)
+            st(f"✓ Sent stego PNG  (hides '{label}')  — tell receiver the password!")
         except Exception as ex:
             st(f"✗ {ex}", err=True)
+
+    # ── steg DECODE ───────────────────────────────────────────
+
+    async def _decode_steg(self):
+        image_path = self._val("#dec-path")
+        password   = self._val("#dec-pass")
+        st_lbl     = self._q("#dec-status", Label)
+        dr         = self._q("#dec-result", RichLog)
+
+        def st(m, err=False):
+            if st_lbl: st_lbl.update(("[red]" if err else "[green]") + m + ("[/red]" if err else "[/green]"))
+
+        if not image_path:                st("⚠  Enter the stego image path", err=True); return
+        if not os.path.isfile(image_path): st(f"⚠  Not found: {image_path}", err=True); return
+        if not password:                  st("⚠  Enter the steg password", err=True); return
+
+        st("Deriving key + decrypting … (may take a moment)")
+        if dr: dr.clear(); dr.write("[dim]Working …[/dim]")
+
+        loop = asyncio.get_event_loop()
+        try:
+            result = await loop.run_in_executor(None, steg_decode, image_path, password)
+        except RuntimeError as e:
+            st(f"✗ {e}", err=True)
+            if dr: dr.clear(); dr.write(f"[red]{e}[/red]")
+            return
+        except Exception as e:
+            st(f"✗ Unexpected: {e}", err=True); return
+
+        ts = datetime.now().strftime("%H:%M")
+        if dr: dr.clear()
+
+        if result["content_type"] == "msg":
+            text = result["payload"].decode("utf-8", errors="replace")
+            st(f"✓ Decoded hidden message ({len(result['payload'])} bytes)")
+            if dr:
+                dr.write(f"[{ts}] [bold magenta]Hidden message:[/bold magenta]")
+                dr.write(f'[white italic]"{text}"[/white italic]')
+        else:
+            save = result["filename"] or f"decoded_{int(time.time())}"
+            b_, e_ = os.path.splitext(save); n = 1
+            while os.path.exists(save): save = f"{b_}_{n}{e_}"; n += 1
+            open(save, "wb").write(result["payload"])
+            saved = os.path.abspath(save)
+            st(f"✓ Extracted → {saved}  ({len(result['payload'])} bytes)")
+            if dr:
+                dr.write(f"[{ts}] [bold magenta]Hidden file extracted:[/bold magenta]")
+                dr.write(f"[bold green]{saved}[/bold green]")
+                dr.write(f"[dim]{len(result['payload'])} bytes  |  ready to open[/dim]")
+            if save.endswith(".zip"):
+                out = save[:-4]
+                try:
+                    import zipfile
+                    with zipfile.ZipFile(save) as z: z.extractall(out)
+                    if dr: dr.write(f"[green]Extracted → {out}/[/green]")
+                except: pass
 
     # ── aliases ───────────────────────────────────────────────
 
     def _save_alias(self):
         name = self._val("#inp-alias-name"); pid = self._val("#inp-alias-id")
         if not name or not pid: return
-        self._aliases[name] = pid; save_aliases(self._aliases)
-        self._draw_alias_log()
+        self._aliases[name] = pid; save_aliases(self._aliases); self._draw_alias_log()
         for sel in ("#inp-alias-name","#inp-alias-id"):
             w = self._q(sel, Input)
             if w: w.value = ""
@@ -713,8 +877,8 @@ class TunnelApp(App):
 
     # ── helpers ───────────────────────────────────────────────
 
-    # Named _check_ready NOT _ready — Textual has an internal _ready() coroutine;
-    # shadowing it causes: TypeError: object bool can't be used in 'await' expression
+    # NOT named _ready — Textual has an internal _ready() coroutine,
+    # shadowing it causes TypeError: object bool can't be used in 'await'
     def _check_ready(self):
         if not self.connected or not self._client:
             self._stg_msg("Not connected — Settings (F1) → Connect", err=True); return False
@@ -738,8 +902,7 @@ def main():
     if not _ok:
         print(f"ERROR: could not import client.py\nDetail: {_err}")
         print("Make sure client.py is in the same directory as tui.py"); sys.exit(1)
-
-    ap = argparse.ArgumentParser(description="Secure Tunnel TUI")
+    ap = argparse.ArgumentParser()
     ap.add_argument("--relay",       default="")
     ap.add_argument("--secret",      default="")
     ap.add_argument("--name",        default="peer")
@@ -748,10 +911,10 @@ def main():
     ap.add_argument("--knock-ports", default="", dest="knock_ports")
     ap.add_argument("--tor",         action="store_true")
     ap.add_argument("--proxy",       default="")
-    ap.add_argument("--steg",        action="store_true")
     ap.add_argument("--auto-accept", action="store_true", dest="auto_accept")
     args = ap.parse_args()
     TunnelApp(args).run()
 
 if __name__ == "__main__":
     main()
+

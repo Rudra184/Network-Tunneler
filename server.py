@@ -1,22 +1,6 @@
+
 #!/usr/bin/env python3
-"""
-relay_server.py — Hardened TLS 1.3 secure relay with port knocking
-  pip install cryptography
-  python3 relay_server.py --secret <key> [--port 4001]
 
-Default knock sequence: 6132 → 8152 → 3101
-Override: --knock-ports 6132,8152,3101
-
-Security stack:
-  • Port knocking    — relay port stays CLOSED until correct knock sequence
-  • TLS 1.3          — all wire traffic encrypted
-  • HMAC + TOTP      — challenge-response, secret never sent over wire
-  • Replay protection — nonce cache + 60s timestamp window
-  • Per-IP banning    — 3 failed auth attempts = 1hr ban
-  • Bandwidth throttle — 20 MB/s per IP token bucket
-  • Zero-knowledge    — relay sees only ciphertext
-  • Audit log         — append-only JSON event log
-"""
 
 import asyncio, json, logging, argparse, sys, time, os, hmac, hashlib
 import struct, ssl, uuid
@@ -173,6 +157,10 @@ async def relay_file(sender_id, sender_name, sender_ip, msg, reader, writer, sen
     size         = int(msg.get("size", 0))
     file_hash    = msg.get("hash", "")
     is_steg      = msg.get("steg", False)
+    # Forward these so the receiver can name saved files correctly and match
+    # the transfer ID shown in the accept prompt.
+    display_name = msg.get("display_name", "file")
+    transfer_id  = msg.get("transfer_id",  "")
 
     if target_id not in peers:
         return await send({"type": "error", "msg": "Target peer not connected"})
@@ -188,6 +176,8 @@ async def relay_file(sender_id, sender_name, sender_ip, msg, reader, writer, sen
         "size":         size,
         "hash":         file_hash,
         "steg":         is_steg,
+        "display_name": display_name,
+        "transfer_id":  transfer_id,
     }))
     await tw.drain()
 
@@ -404,3 +394,4 @@ if __name__ == "__main__":
         audit("server_stop")
         AUDIT_FILE.close()
         sys.exit(0)
+

@@ -1,43 +1,65 @@
+
 #!/usr/bin/env python3
 """
 client.py — Secure E2E tunnel client
   pip install cryptography pillow
   python3 client.py --relay <ip> --secret <key> --name <you> [options]
 
-Steganography (Pillow LSB):
-  Any image format (JPG, PNG, BMP, TIFF, WebP) accepted as cover.
-  The payload is AES-256-GCM encrypted with the shared E2E key before
-  embedding — without the key, extracted LSBs are indistinguishable
-  from noise. Output is always PNG (lossless) so embedded bits survive.
+══ STEGANOGRAPHY ══════════════════════════════════════════════════════════════
 
-How to use steg:
-  SENDER (TUI):
-    1. Go to the Steg tab (F4)
-    2. Enter the cover image path (any JPG or PNG you own)
-    3. Choose "Hide a file" or "Hide a text message"
-    4. Enter the file path or message text
-    5. Click "Embed & Send" — the hidden data goes to the selected peer
+  SENDER (Steg tab → ENCODE):
+    1. Enter a cover image path (JPG, PNG, BMP, TIFF, WebP …)
+    2. Choose "Hide a file" (any type) or "Hide a text message"
+    3. Enter a steg password — tell the receiver this out-of-band
+    4. Click Embed & Send
 
-  RECEIVER (TUI):
-    1. A popup appears: "Incoming Transfer" — click Accept
-    2. The steg PNG is downloaded automatically
-    3. The hidden content is extracted + decrypted
-    4. For a hidden FILE: saved to disk, path shown in the Files tab log
-    5. For a hidden MESSAGE: shown directly in the Files tab log
+  RECEIVER (Steg tab → DECODE):
+    1. Accept the incoming file popup — stego PNG is saved to:
+         <same folder as client.py>/received_steg/
+    2. Go to Steg tab → DECODE section (path is auto-filled)
+    3. Enter the steg password the sender told you
+    4. Click Decode
+       • Hidden FILE  → saved to disk, full path shown
+       • Hidden TEXT  → shown on screen in the result panel
 
-  ENCODING (what happens internally):
-    payload → AES-256-GCM encrypt → embed in cover image LSBs → send as PNG
+  SECURITY:
+    • Steg password is NEVER transmitted over the network
+    • AES-256-GCM key derived via PBKDF2-HMAC-SHA256 (200k iterations)
+    • Without the password, extracted LSBs are indistinguishable from noise
 
-  DECODING (what happens internally):
-    receive PNG → extract LSBs → AES-256-GCM decrypt → save hidden file / show message
+══════════════════════════════════════════════════════════════════════════════
 """
 
 import asyncio, json, os, sys, argparse, logging, base64, zipfile
 import struct, hmac, hashlib, ssl, time, tempfile, random, subprocess
 import shutil, platform, urllib.request, io
-import readline as rl
 from collections import defaultdict
 from urllib.parse import urlparse
+
+# ── Windows: force UTF-8 on stdout/stderr so Unicode chars don't crash ────────
+if platform.system().lower() == "windows":
+    import ctypes
+    try:
+        ctypes.windll.kernel32.SetConsoleOutputCP(65001)   # CP_UTF8
+    except Exception:
+        pass
+    try:
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+        sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
+
+# ── Tab-completion: readline on Linux/macOS, pyreadline3 on Windows, else off ─
+_HAS_READLINE = False
+try:
+    import readline as rl
+    _HAS_READLINE = True
+except ImportError:
+    try:
+        import pyreadline3 as rl          # pip install pyreadline3
+        _HAS_READLINE = True
+    except ImportError:
+        rl = None                          # no completion — still works fine
 
 from cryptography.hazmat.primitives.asymmetric.x25519 import X25519PrivateKey, X25519PublicKey
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
@@ -45,15 +67,15 @@ from cryptography.hazmat.primitives.serialization import Encoding, PublicFormat
 from cryptography.hazmat.primitives.kdf.hkdf import HKDF
 from cryptography.hazmat.primitives.hashes import SHA256
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s  %(levelname)-7s  %(message)s",
-    datefmt="%H:%M:%S"
-)
+logging.basicConfig(level=logging.INFO,
+    format="%(asctime)s  %(levelname)-7s  %(message)s", datefmt="%H:%M:%S")
 log = logging.getLogger("client")
 
-CHUNK  = 65536
+CHUNK = 65536
 SYSTEM = platform.system().lower()
+
+# Stego PNGs received are always saved here — predictable and absolute
+STEG_RECV_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "received_steg")
 
 # ── Aliases ───────────────────────────────────────────────────────────────────
 
@@ -76,10 +98,6 @@ def resolve(x):
 TOR_PORT     = 9055
 TOR_DIR      = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".tor_data")
 _tor_process = None
-TOR_WIN_URL  = (
-    "https://archive.torproject.org/tor-package-archive/"
-    "torbrowser/13.0.15/tor-expert-bundle-windows-x86_64-13.0.15.tar.gz"
-)
 
 def _tor_binary():
     t = shutil.which("tor")
@@ -87,76 +105,56 @@ def _tor_binary():
     local = os.path.join(TOR_DIR, "bin", "tor" + (".exe" if SYSTEM == "windows" else ""))
     return local if os.path.isfile(local) else None
 
-def _install_tor():
-    log.info("Tor not found — installing …")
-    if SYSTEM == "linux":
-        for mgr, cmd in [
-            ("apt-get", ["sudo","apt-get","install","-y","tor"]),
-            ("dnf",     ["sudo","dnf","install","-y","tor"]),
-            ("pacman",  ["sudo","pacman","-Sy","--noconfirm","tor"]),
-            ("apk",     ["sudo","apk","add","tor"]),
-        ]:
-            if shutil.which(mgr): subprocess.run(cmd, check=True); return
-        raise RuntimeError("No package manager found. Install tor manually.")
-    elif SYSTEM == "darwin":
-        if shutil.which("brew"): subprocess.run(["brew","install","tor"], check=True)
-        else: raise RuntimeError("Run: brew install tor")
-    elif SYSTEM == "windows":
-        import tarfile
-        os.makedirs(TOR_DIR, exist_ok=True)
-        archive = os.path.join(TOR_DIR, "tor.tar.gz")
-        urllib.request.urlretrieve(TOR_WIN_URL, archive,
-            reporthook=lambda b,bs,ts: print(f"\r  Downloading … {min(100,int(b*bs*100/(ts or 1)))}%", end="", flush=True))
-        print()
-        with tarfile.open(archive,"r:gz") as tar: tar.extractall(TOR_DIR)
-        for root,_,files in os.walk(TOR_DIR):
-            for f in files:
-                if f.lower()=="tor.exe":
-                    dest=os.path.join(TOR_DIR,"bin"); os.makedirs(dest,exist_ok=True)
-                    shutil.copy2(os.path.join(root,f),os.path.join(dest,"tor.exe")); return
-        raise RuntimeError("tor.exe not found in archive")
-    else:
-        raise RuntimeError(f"Unsupported OS: {SYSTEM}")
-
 def start_tor():
     global _tor_process
-    if not _tor_binary(): _install_tor()
+    if not _tor_binary():
+        if SYSTEM == "linux":
+            for mgr, cmd in [
+                ("apt-get", ["sudo","apt-get","install","-y","tor"]),
+                ("dnf",     ["sudo","dnf","install","-y","tor"]),
+                ("pacman",  ["sudo","pacman","-Sy","--noconfirm","tor"]),
+            ]:
+                if shutil.which(mgr): subprocess.run(cmd, check=True); break
+        elif SYSTEM == "darwin":
+            subprocess.run(["brew","install","tor"], check=True)
+        else:
+            raise RuntimeError("Install Tor manually and ensure 'tor' is on PATH")
     os.makedirs(TOR_DIR, exist_ok=True)
     torrc = os.path.join(TOR_DIR, "torrc")
     open(torrc,"w").write(
-        f"SocksPort 127.0.0.1:{TOR_PORT}\n"
-        f"DataDirectory {TOR_DIR}\n"
-        "Log notice stderr\nControlPort 0\n"
+        f"SocksPort 127.0.0.1:{TOR_PORT}\nDataDirectory {TOR_DIR}\nLog notice stderr\n"
     )
     log.info("Starting Tor on 127.0.0.1:%d …", TOR_PORT)
-    _tor_process = subprocess.Popen(
-        [_tor_binary(), "-f", torrc],
+    _popen_kwargs = dict(
         stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True
+    )
+    if platform.system().lower() == "windows":
+        _popen_kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW
+    _tor_process = subprocess.Popen(
+        [_tor_binary(), "-f", torrc], **_popen_kwargs
     )
     deadline = time.time() + 60
     while time.time() < deadline:
         line = _tor_process.stderr.readline()
         if not line:
             if _tor_process.poll() is not None:
-                raise RuntimeError(f"Tor exited (code {_tor_process.returncode})")
+                raise RuntimeError(f"Tor exited ({_tor_process.returncode})")
             time.sleep(0.1); continue
-        if "100%" in line or "Bootstrapped 100" in line:
-            log.info("Tor ready on 127.0.0.1:%d", TOR_PORT); return
-    raise RuntimeError("Tor did not bootstrap within 60s")
+        if "Bootstrapped 100" in line: log.info("Tor ready"); return
+    raise RuntimeError("Tor did not bootstrap in 60s")
 
 def stop_tor():
     global _tor_process
     if _tor_process and _tor_process.poll() is None:
-        log.info("Stopping Tor …")
         _tor_process.terminate()
-        try:    _tor_process.wait(timeout=5)
+        try: _tor_process.wait(timeout=5)
         except: _tor_process.kill()
         _tor_process = None
 
 # ── Port knocking ─────────────────────────────────────────────────────────────
 
 async def send_knock_sequence(host, ports):
-    log.info("Knocking %s  →  %s", host, " → ".join(map(str, ports)))
+    log.info("Knocking %s: %s", host, " → ".join(map(str, ports)))
     for port in ports:
         try:
             _, w = await asyncio.wait_for(asyncio.open_connection(host, port), timeout=3)
@@ -179,8 +177,7 @@ async def socks5_connect(proxy_host, proxy_port, target_host, target_port):
     await writer.drain()
     hdr = await reader.readexactly(4)
     if hdr[1] != 0:
-        codes = {1:"general failure",2:"not allowed",3:"net unreachable",
-                 4:"host unreachable",5:"connection refused"}
+        codes = {1:"general failure",2:"not allowed",3:"net unreachable",4:"host unreachable",5:"connection refused"}
         raise RuntimeError(f"SOCKS5: {codes.get(hdr[1], str(hdr[1]))}")
     atyp = hdr[3]
     if   atyp == 1: await reader.readexactly(6)
@@ -193,17 +190,16 @@ async def socks5_connect(proxy_host, proxy_port, target_host, target_port):
 _CIPHERS = [
     "TLS_AES_256_GCM_SHA384","TLS_AES_128_GCM_SHA256","TLS_CHACHA20_POLY1305_SHA256",
     "ECDHE-RSA-AES256-GCM-SHA384","ECDHE-RSA-AES128-GCM-SHA256",
-    "ECDHE-ECDSA-AES256-GCM-SHA384","ECDHE-ECDSA-AES128-GCM-SHA256",
-    "ECDHE-RSA-CHACHA20-POLY1305","DHE-RSA-AES256-GCM-SHA384",
+    "ECDHE-ECDSA-AES256-GCM-SHA384","ECDHE-RSA-CHACHA20-POLY1305",
 ]
 
 def build_tls_ctx():
     ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
-    try:    ctx.minimum_version = ssl.TLSVersion.TLSv1_3
+    try: ctx.minimum_version = ssl.TLSVersion.TLSv1_3
     except: pass
     ctx.check_hostname = False; ctx.verify_mode = ssl.CERT_NONE
     shuffled = _CIPHERS[:]; random.shuffle(shuffled)
-    try:    ctx.set_ciphers(":".join(shuffled))
+    try: ctx.set_ciphers(":".join(shuffled))
     except: pass
     return ctx
 
@@ -220,7 +216,7 @@ def _totp(secret, drift=0, interval=30, digits=6):
     code = (struct.unpack(">I", h[off:off+4])[0] & 0x7FFFFFFF) % (10 ** digits)
     return str(code).zfill(digits)
 
-# ── Crypto ────────────────────────────────────────────────────────────────────
+# ── Crypto helpers ────────────────────────────────────────────────────────────
 
 def sha256_file(path):
     h = hashlib.sha256()
@@ -232,102 +228,90 @@ def compute_encrypted_size(file_size):
     n = max(1, (file_size + CHUNK - 1) // CHUNK)
     return 32 + n * (4 + 12 + 16) + file_size
 
-def encrypt_payload(data: bytes, key: bytes) -> bytes:
-    """AES-256-GCM encrypt. Returns: 12-byte nonce + ciphertext+tag."""
-    nonce = os.urandom(12)
-    return nonce + AESGCM(key).encrypt(nonce, data, None)
+# ── Steganography — Pillow LSB with PBKDF2 password ──────────────────────────
 
-def decrypt_payload(data: bytes, key: bytes) -> bytes:
-    """Decrypt output of encrypt_payload."""
-    return AESGCM(key).decrypt(data[:12], data[12:], None)
-
-# ── Steganography — Pillow LSB ────────────────────────────────────────────────
+_PBKDF2_ITERS = 200_000
 
 def _check_pillow():
-    try:
-        import PIL
-    except ImportError:
-        raise RuntimeError(
-            "Pillow is required for steganography.\n"
-            "Install:  pip install pillow\n"
-            "(Only needed for the Steg feature.)"
-        )
+    try:    import PIL
+    except: raise RuntimeError("Pillow not installed. Run: pip install pillow")
 
+def _derive_steg_key(password: str, salt: bytes) -> bytes:
+    return hashlib.pbkdf2_hmac("sha256", password.encode(), salt, _PBKDF2_ITERS, dklen=32)
 
-def steg_embed(cover_path: str, encrypted_payload: bytes) -> bytes:
-    """
-    Embed an already-encrypted payload into a cover image using Pillow LSB.
-
-    Accepts any image format Pillow can open (JPG, PNG, BMP, TIFF, WebP …).
-    Opens the image, converts to RGB, modifies the LSB of each channel.
-    Output is always PNG (lossless) so the embedded bits survive.
-
-    Only 1 bit per channel is changed — visually imperceptible (±1 out of 255).
-    The payload is already AES-256-GCM encrypted by the caller — without the
-    shared key, the embedded data looks like random noise.
-    """
+def _open_rgb(src):
     _check_pillow()
     from PIL import Image
-
     try:
-        img = Image.open(cover_path).convert("RGB")
+        img = Image.open(src if isinstance(src, (str, os.PathLike)) else io.BytesIO(src))
+        return img.convert("RGB")
     except Exception as e:
-        raise RuntimeError(
-            f"Cannot open cover image: {os.path.basename(cover_path)}\n"
-            f"  Error: {e}\n"
-            f"  Supported: JPG, PNG, BMP, TIFF, WebP and most other formats."
-        )
+        raise RuntimeError(f"Cannot open image: {e}")
 
-    width, height  = img.size
-    pixels         = list(img.getdata())
-    total_channels = len(pixels) * 3
+def steg_encode(cover_path: str, payload: bytes, password: str,
+                content_type: str = "file", filename: str = "") -> bytes:
+    """
+    Embed payload into cover image using Pillow LSB.
+    Key derived from password via PBKDF2 — password never transmitted.
+    Output is always PNG (lossless). Any input format accepted.
+    """
+    if not password:
+        raise RuntimeError("Steg password cannot be empty.")
+    img    = _open_rgb(cover_path)
+    w, h   = img.size
+    pixels = list(img.getdata())
+    total  = len(pixels) * 3
 
-    # Layout in image: 4-byte big-endian length header + payload bytes
-    full        = struct.pack(">I", len(encrypted_payload)) + encrypted_payload
+    ct_byte  = b"\x00" if content_type == "file" else b"\x01"
+    fn_bytes = filename.encode("utf-8")[:65535]
+    plain    = ct_byte + struct.pack(">H", len(fn_bytes)) + fn_bytes + payload
+
+    salt       = os.urandom(16)
+    key        = _derive_steg_key(password, salt)
+    nonce      = os.urandom(12)
+    ciphertext = AESGCM(key).encrypt(nonce, plain, None)
+
+    blob        = salt + nonce + ciphertext
+    full        = struct.pack(">I", len(blob)) + blob
     bits_needed = len(full) * 8
 
-    if bits_needed > total_channels:
-        cap_kb  = total_channels // (8 * 1024)
-        need_kb = bits_needed   // (8 * 1024) + 1
+    if bits_needed > total:
+        cap  = total // (8 * 1024)
+        need = bits_needed // (8 * 1024) + 1
         raise RuntimeError(
             f"Cover image too small.\n"
-            f"  Image capacity : {width}×{height} px  →  ~{cap_kb} KB\n"
-            f"  Payload needs  : ~{need_kb} KB\n"
-            f"  Use a larger or higher-resolution image."
+            f"  {w}×{h} px → ~{cap} KB capacity,  payload needs ~{need} KB.\n"
+            f"  Use a larger image."
         )
 
     flat = []
     for r, g, b in pixels:
         flat.append(r); flat.append(g); flat.append(b)
 
-    bit_idx = 0
+    idx = 0
     for byte in full:
         for shift in range(7, -1, -1):
-            flat[bit_idx] = (flat[bit_idx] & 0xFE) | ((byte >> shift) & 1)
-            bit_idx += 1
+            flat[idx] = (flat[idx] & 0xFE) | ((byte >> shift) & 1)
+            idx += 1
 
-    new_pixels = [(flat[i], flat[i+1], flat[i+2]) for i in range(0, len(flat), 3)]
-    out = Image.new("RGB", (width, height))
-    out.putdata(new_pixels)
-
+    from PIL import Image
+    out = Image.new("RGB", (w, h))
+    out.putdata([(flat[i], flat[i+1], flat[i+2]) for i in range(0, len(flat), 3)])
     buf = io.BytesIO()
     out.save(buf, format="PNG", optimize=False)
     return buf.getvalue()
 
 
-def steg_extract(png_bytes: bytes) -> bytes:
+def steg_decode(image_path_or_bytes, password: str) -> dict:
     """
-    Extract encrypted payload from a stego PNG produced by steg_embed.
-    Returns raw encrypted bytes — caller decrypts with decrypt_payload().
+    Extract and decrypt hidden payload from a stego PNG.
+    Returns dict with keys: content_type ("file"/"msg"), filename, payload (bytes).
+    Raises RuntimeError with a user-friendly message on any failure.
     """
-    _check_pillow()
-    from PIL import Image
+    if not password:
+        raise RuntimeError("Steg password cannot be empty.")
 
-    try:
-        img = Image.open(io.BytesIO(png_bytes)).convert("RGB")
-    except Exception as e:
-        raise RuntimeError(f"Cannot decode received stego image: {e}")
-
+    img    = _open_rgb(image_path_or_bytes)
     pixels = list(img.getdata())
     flat   = []
     for r, g, b in pixels:
@@ -337,42 +321,51 @@ def steg_extract(png_bytes: bytes) -> bytes:
     for i in range(32):
         length = (length << 1) | (flat[i] & 1)
 
-    if length <= 0:
-        raise RuntimeError("No steganographic payload found in this image.")
-
-    if length * 8 + 32 > len(flat):
+    if length <= 0 or 32 + length * 8 > len(flat):
         raise RuntimeError(
-            f"Payload length ({length} B) exceeds image capacity.\n"
-            "The image may be corrupt or was not encoded with this tool."
+            "No steganographic payload found in this image.\n"
+            "Make sure this is the stego PNG received, not the original cover."
         )
 
-    result = bytearray()
-    for byte_idx in range(length):
+    raw = bytearray()
+    for bi in range(length):
         byte = 0
-        for bit_pos in range(8):
-            byte = (byte << 1) | (flat[32 + byte_idx * 8 + bit_pos] & 1)
-        result.append(byte)
+        for bp in range(8):
+            byte = (byte << 1) | (flat[32 + bi * 8 + bp] & 1)
+        raw.append(byte)
+    raw = bytes(raw)
 
-    return bytes(result)
+    if len(raw) < 16 + 12 + 17:
+        raise RuntimeError("Extracted data too short — image may be corrupt.")
 
+    salt, nonce, ciphertext = raw[:16], raw[16:28], raw[28:]
+    key = _derive_steg_key(password, salt)
 
-def _make_noise_png(path: str, min_payload_bytes: int):
-    """Generate a random-pixel PNG large enough to hold min_payload_bytes."""
-    _check_pillow()
-    from PIL import Image
-    bits  = (min_payload_bytes + 4) * 8
-    n_px  = (bits + 2) // 3
-    side  = max(64, int(n_px ** 0.5) + 1)
-    w, h  = side, (n_px + side - 1) // side + 1
-    raw   = [(random.randint(0,255), random.randint(0,255), random.randint(0,255))
-             for _ in range(w * h)]
-    img = Image.new("RGB", (w, h))
-    img.putdata(raw)
-    img.save(path, format="PNG")
+    try:
+        plain = AESGCM(key).decrypt(nonce, ciphertext, None)
+    except Exception:
+        raise RuntimeError(
+            "Wrong password — decryption failed.\n"
+            "Use the exact same password the sender used."
+        )
+
+    if len(plain) < 3:
+        raise RuntimeError("Decrypted payload is malformed.")
+
+    fn_len   = struct.unpack(">H", plain[1:3])[0]
+    if len(plain) < 3 + fn_len:
+        raise RuntimeError("Decrypted payload truncated.")
+
+    return {
+        "content_type": "file" if plain[0] == 0x00 else "msg",
+        "filename":     plain[3:3+fn_len].decode("utf-8", errors="replace"),
+        "payload":      plain[3+fn_len:],
+    }
 
 # ── Tab completion ────────────────────────────────────────────────────────────
 
-COMMANDS = ["list","myid","send","steg","stegmsg","chat","msg","alias","aliases","history","exit"]
+COMMANDS = ["list","myid","send","steg","stegmsg","stegdecode",
+            "chat","msg","alias","aliases","history","exit"]
 
 class Completer:
     def __init__(self, c): self.client = c
@@ -380,10 +373,10 @@ class Completer:
         line  = rl.get_line_buffer(); parts = line.split()
         peers = list(self.client.peers.keys()) if self.client else []
         al    = list(aliases.keys())
-        if len(parts) == 0 or (len(parts) == 1 and not line.endswith(" ")):
+        if len(parts) == 0 or (len(parts)==1 and not line.endswith(" ")):
             opts = [c for c in COMMANDS if c.startswith(text)]
-        elif len(parts) == 1 or (len(parts) == 2 and not line.endswith(" ")):
-            opts = [p for p in peers + al if p.startswith(text)]
+        elif len(parts)==1 or (len(parts)==2 and not line.endswith(" ")):
+            opts = [p for p in peers+al if p.startswith(text)]
         else: opts = []
         try:    return opts[state]
         except: return None
@@ -393,14 +386,10 @@ class Completer:
 class RelayClient:
     def __init__(self, host, port, name, secret,
                  fingerprint=None, proxy=None,
-                 use_steg=False, knock_ports=None, auto_accept=False):
-        self.host        = host
-        self.port        = port
-        self.name        = name
-        self.secret      = secret.encode()
-        self.fingerprint = fingerprint
-        self.proxy       = proxy
-        self.use_steg    = use_steg
+                 knock_ports=None, auto_accept=False):
+        self.host        = host;         self.port        = port
+        self.name        = name;         self.secret      = secret.encode()
+        self.fingerprint = fingerprint;  self.proxy       = proxy
         self.knock_ports = knock_ports or []
         self.auto_accept = auto_accept
 
@@ -409,23 +398,30 @@ class RelayClient:
 
         self._priv    = X25519PrivateKey.generate()
         self._pub_raw = self._priv.public_key().public_bytes(Encoding.Raw, PublicFormat.Raw)
-
         self._pubkey_raw  = {}; self._pubkey_wait = defaultdict(list)
         self._key_cache   = {}; self._xfer_done   = asyncio.Event()
         self._history     = []; self._chat_peer   = None
 
-        # Optional callbacks set by the TUI so it can show status without print()
-        # _on_steg_received(saved_path, size_bytes, from_name, steg_type)
-        self._on_steg_received = None
-        # _on_xfer_status(message_str, is_error)
-        self._on_xfer_status   = None
+        # _file_gate: SET = _recv_loop may readline(); CLEAR = file bytes in
+        # flight, _recv_loop must block so it doesn't chew through binary data.
+        # PNG payloads contain 0x0A bytes — readline() would silently consume
+        # chunks of the payload before _receive_file even wakes up.
+        self._file_gate = asyncio.Event()
+        self._file_gate.set()   # open by default
+
+        # TUI hooks — set by tui.py before connect()
+        # _on_stego_saved(saved_path: str, from_name: str, size: int)
+        self._on_stego_saved = None
+        # _on_xfer_status(message: str, is_error: bool)
+        self._on_xfer_status = None
 
     def _xfer_log(self, msg: str, err: bool = False):
-        """Write a status line — goes to TUI callback if set, else print()."""
+        """Route a status message to TUI callback or print()."""
         if self._on_xfer_status:
             self._on_xfer_status(msg, err)
         else:
-            print(msg)
+            prefix = "✗" if err else "✓"
+            print(f"  {prefix} {msg}")
 
     # ── connection ────────────────────────────────────────────
 
@@ -433,36 +429,28 @@ class RelayClient:
         if self.knock_ports: await send_knock_sequence(self.host, self.knock_ports)
         ctx = build_tls_ctx()
         if self.proxy:
-            raw_r, raw_w = await socks5_connect(
-                self.proxy.hostname, self.proxy.port, self.host, self.port)
-            sock = raw_w.transport.get_extra_info("socket")
-            self.reader, self.writer = await asyncio.open_connection(
-                sock=sock, ssl=ctx, server_hostname=self.host)
+            rr, rw = await socks5_connect(self.proxy.hostname, self.proxy.port, self.host, self.port)
+            sock = rw.transport.get_extra_info("socket")
+            self.reader, self.writer = await asyncio.open_connection(sock=sock, ssl=ctx, server_hostname=self.host)
         else:
-            self.reader, self.writer = await asyncio.open_connection(
-                self.host, self.port, ssl=ctx)
+            self.reader, self.writer = await asyncio.open_connection(self.host, self.port, ssl=ctx)
 
         actual_fp = get_fp(self.writer)
         if self.fingerprint:
             if not hmac.compare_digest(actual_fp, self.fingerprint):
                 self.writer.close()
-                raise RuntimeError(
-                    f"TLS FINGERPRINT MISMATCH\n"
-                    f"  Expected : {self.fingerprint}\n"
-                    f"  Got      : {actual_fp}")
+                raise RuntimeError(f"TLS FINGERPRINT MISMATCH\n  Expected: {self.fingerprint}\n  Got: {actual_fp}")
             log.info("Cert fingerprint OK ✓")
         else:
             print(f"\n  ⚠  Server fingerprint: {actual_fp}\n")
 
         raw       = await self.reader.readline()
         challenge = json.loads(raw.decode().strip())
-        if challenge.get("type") != "challenge":
-            raise RuntimeError(f"Bad handshake: {challenge}")
+        if challenge.get("type") != "challenge": raise RuntimeError(f"Bad handshake: {challenge}")
 
         nonce    = challenge["nonce"]; ts = int(time.time())
         hmac_val = hmac.new(self.secret, f"{nonce}{ts}".encode(), hashlib.sha256).hexdigest()
         totp_key = hashlib.sha256(self.secret + b":totp").digest()
-
         await self._send({
             "type":"register","name":self.name,"nonce":nonce,"ts":ts,
             "hmac":hmac_val,"totp":_totp(totp_key),
@@ -472,9 +460,7 @@ class RelayClient:
         raw = await self.reader.readline()
         if not raw: raise RuntimeError("Auth rejected")
         welcome = json.loads(raw.decode().strip())
-        if welcome.get("type") != "welcome":
-            raise RuntimeError(f"Auth failed: {welcome}")
-
+        if welcome.get("type") != "welcome": raise RuntimeError(f"Auth failed: {welcome}")
         self.my_id = welcome["your_id"]
         log.info("Connected  id=%s", self.my_id)
         self._task = asyncio.create_task(self._recv_loop())
@@ -492,110 +478,81 @@ class RelayClient:
 
     # ── pubkey / ECDH ─────────────────────────────────────────
 
-    async def get_pubkey_raw(self, peer_id):
-        if peer_id in self._pubkey_raw: return self._pubkey_raw[peer_id]
+    async def get_pubkey_raw(self, pid):
+        if pid in self._pubkey_raw: return self._pubkey_raw[pid]
         loop = asyncio.get_event_loop()
         fut  = loop.create_future()
-        self._pubkey_wait[peer_id].append(fut)
-        await self._send({"type":"get_pubkey","peer_id":peer_id})
+        self._pubkey_wait[pid].append(fut)
+        await self._send({"type":"get_pubkey","peer_id":pid})
         try:    return await asyncio.wait_for(fut, timeout=10)
         except: return None
 
-    async def get_shared_key(self, peer_id):
-        if peer_id in self._key_cache: return self._key_cache[peer_id]
-        raw = await self.get_pubkey_raw(peer_id)
+    async def get_shared_key(self, pid):
+        if pid in self._key_cache: return self._key_cache[pid]
+        raw = await self.get_pubkey_raw(pid)
         if raw is None: return None
         shared = self._priv.exchange(X25519PublicKey.from_public_bytes(raw))
         key    = HKDF(algorithm=SHA256(), length=32, salt=None, info=b"e2e-key").derive(shared)
-        self._key_cache[peer_id] = key
+        self._key_cache[pid] = key
         return key
 
-    # ── accept / reject ───────────────────────────────────────
+    # ── accept prompt ─────────────────────────────────────────
 
-    async def _prompt_accept(self, transfer_id, from_name, filename, size_bytes):
-        """Default terminal prompt. Replaced by tui.py with a modal."""
+    async def _prompt_accept(self, tid, from_name, filename, size_bytes):
         if self.auto_accept: return True
         size_str = (
             f"{size_bytes/(1024*1024):.1f} MB" if size_bytes > 1_048_576
             else f"{size_bytes//1024} KB"       if size_bytes > 1024
             else f"{size_bytes} bytes"
         )
-        print(f"\n  ┌─ Incoming file ─────────────────────────────────")
+        print(f"\n  ┌─ Incoming ────────────────────────────────────────")
         print(f"  │  From : {from_name}")
         print(f"  │  File : {filename}")
         print(f"  │  Size : {size_str}")
-        print(f"  │  [y]es / [n]o   (auto-rejects in 30 s)")
-        print(f"  └────────────────────────────────────────────────")
+        print(f"  │  [y]es / [n]o  (auto-rejects in 30 s)")
+        print(f"  └───────────────────────────────────────────────────")
         loop   = asyncio.get_event_loop()
-        event  = asyncio.Event()
-        result = {"accepted": False}
-        self._pending = (event, result)
-        try:    await asyncio.wait_for(event.wait(), timeout=30)
-        except: print("  ✗ Auto-rejected"); result["accepted"] = False
-        return result["accepted"]
+        ev     = asyncio.Event()
+        result = {"ok": False}
+        self._pending = (ev, result)
+        try:    await asyncio.wait_for(ev.wait(), timeout=30)
+        except: print("  ✗ Auto-rejected"); result["ok"] = False
+        return result["ok"]
 
     # ── steg send ─────────────────────────────────────────────
 
     async def send_steg(self, target_id: str, cover_path: str,
-                        payload: bytes, label: str = "data"):
-        """
-        Encrypt payload, embed into cover image, send to target.
-
-        The metadata sent to the relay includes TWO encrypted filenames:
-          filename_enc    = cover image name (what the stego PNG is called)
-          hidden_name_enc = actual hidden content name (the file/label)
-
-        BUG FIX: previously only the cover name was sent, so the receiver
-        saved the extracted file with the wrong name (e.g. "photo.jpg"
-        instead of "document.pdf"). Now hidden_name_enc carries the real name.
-        """
+                        payload: bytes, password: str,
+                        content_type: str = "file", filename: str = ""):
         if not os.path.isfile(cover_path):
             raise RuntimeError(f"Cover image not found: {cover_path}")
         if target_id not in self.peers:
             raise RuntimeError(f"Peer {target_id!r} not connected")
+        if not password:
+            raise RuntimeError("Steg password cannot be empty.")
 
-        key = await self.get_shared_key(target_id)
-        if key is None:
-            raise RuntimeError("Could not retrieve peer public key")
+        log.info("Steg encode: %d B %s payload → PBKDF2+AES → LSB embed", len(payload), content_type)
+        steg_png = steg_encode(cover_path, payload, password, content_type, filename)
+        log.info("Steg PNG ready: %d bytes → sending to %s", len(steg_png), target_id)
 
-        # Step 1: encrypt the payload
-        encrypted = encrypt_payload(payload, key)
-
-        # Step 2: embed into cover image
-        steg_png = steg_embed(cover_path, encrypted)
-
-        aesgcm = AESGCM(key)
-
-        # Step 3: encrypt the cover filename (relay never sees real filenames)
-        fn_n   = os.urandom(12)
-        fn_b64 = base64.b64encode(
-            fn_n + aesgcm.encrypt(fn_n, os.path.basename(cover_path).encode(), None)
-        ).decode()
-
-        # Step 4: encrypt the hidden content's name so receiver knows what to call it
-        # For "steg file.pdf photo.jpg" the hidden name is "file.pdf"
-        # For "stegmsg"                 the hidden name is "message" (no file to save)
-        hn_n   = os.urandom(12)
-        hn_b64 = base64.b64encode(
-            hn_n + aesgcm.encrypt(hn_n, label.encode(), None)
-        ).decode()
-
-        steg_type = "msg" if label == "message" else "file"
-
-        log.info("Steg send: %d B payload → %d B PNG → %s (type=%s)",
-                 len(payload), len(steg_png), target_id, steg_type)
+        key    = await self.get_shared_key(target_id)
+        aesgcm = AESGCM(key) if key else None
+        fn_b64 = ""
+        if aesgcm:
+            fn_n   = os.urandom(12)
+            fn_b64 = base64.b64encode(
+                fn_n + aesgcm.encrypt(fn_n, os.path.basename(cover_path).encode(), None)
+            ).decode()
 
         await self._send({
-            "type":             "send_file",
-            "to":               target_id,
-            "filename_enc":     fn_b64,       # cover image name (for display)
-            "hidden_name_enc":  hn_b64,       # actual hidden file/label name ← NEW
-            "size":             len(steg_png),
-            "hash":             hashlib.sha256(steg_png).hexdigest(),
-            "steg":             True,
-            "steg_type":        steg_type,
-            "transfer_id":      os.urandom(8).hex(),
-            "display_name":     os.path.basename(cover_path),
+            "type":         "send_file",
+            "to":           target_id,
+            "filename_enc": fn_b64,
+            "size":         len(steg_png),
+            "hash":         hashlib.sha256(steg_png).hexdigest(),
+            "steg":         True,
+            "transfer_id":  os.urandom(8).hex(),
+            "display_name": os.path.basename(cover_path),
         })
         self.writer.write(steg_png)
         await self.writer.drain()
@@ -629,18 +586,11 @@ class RelayClient:
         fhash  = sha256_file(path)
         aesgcm = AESGCM(key); fn_n = os.urandom(12)
         fn_b64 = base64.b64encode(fn_n + aesgcm.encrypt(fn_n, fname.encode(), None)).decode()
-
-        if self.use_steg:
-            tmp_cover = tempfile.mktemp(suffix=".png")
-            _make_noise_png(tmp_cover, compute_encrypted_size(fsize))
-            try:    await self.send_steg(target_id, tmp_cover, open(path,"rb").read(), label=fname)
-            finally: os.unlink(tmp_cover)
-            if tmp: os.unlink(tmp); return
-
         enc_size = compute_encrypted_size(fsize)
+
         await self._send({
             "type":"send_file","to":target_id,"filename_enc":fn_b64,
-            "hidden_name_enc":"","size":enc_size,"hash":fhash,"steg":False,
+            "size":enc_size,"hash":fhash,"steg":False,
             "transfer_id":os.urandom(8).hex(),"display_name":fname,
         })
 
@@ -685,6 +635,9 @@ class RelayClient:
     async def _recv_loop(self):
         try:
             while True:
+             
+                await self._file_gate.wait()
+
                 raw = await self.reader.readline()
                 if not raw: break
                 try:    msg = json.loads(raw.decode().strip())
@@ -701,6 +654,9 @@ class RelayClient:
                     for fut in self._pubkey_wait.pop(pid,[]):
                         if not fut.done(): fut.set_result(rb)
                 elif t == "incoming_file":
+                    # Close the gate BEFORE scheduling the task so the next
+                    # await self._file_gate.wait() above blocks immediately.
+                    self._file_gate.clear()
                     asyncio.create_task(self._receive_file(msg))
                 elif t == "msg":
                     await self._receive_message(msg)
@@ -708,186 +664,209 @@ class RelayClient:
                     self._history.append({"dir":"sent","ts":time.time(),"size":msg.get("size",0)})
                     self._xfer_done.set()
                 elif t == "error":
-                    self._xfer_log(f"  ✗ Relay: {msg.get('msg','')}", err=True)
+                    self._xfer_log(f"Relay error: {msg.get('msg','')}", err=True)
                     self._xfer_done.set()
         except (asyncio.IncompleteReadError, ConnectionResetError, BrokenPipeError):
             log.warning("Connection lost")
         except asyncio.CancelledError: pass
-        except Exception as e: log.exception("Recv: %s", e)
+        except Exception as e: log.exception("Recv loop: %s", e)
 
     async def _prefetch_pubkey(self, pid):
         await self.get_pubkey_raw(pid)
 
     async def _receive_file(self, meta):
-        from_id    = meta["from_id"]; from_name = meta["from_name"]
-        size       = int(meta["size"]); fhash = meta.get("hash","")
-        fn_b64     = meta.get("filename_enc","")
-        hn_b64     = meta.get("hidden_name_enc","")   # hidden content name ← NEW
-        is_steg    = meta.get("steg", False)
-        steg_type  = meta.get("steg_type","file")
-        disp_name  = meta.get("display_name","file")
-        xfer_id    = meta.get("transfer_id", os.urandom(8).hex())
+        """
+        Receive an incoming file or stego PNG.
 
-        key = await self.get_shared_key(from_id)
-        if key is None:
-            rem = size
-            while rem > 0:
-                c = await self.reader.read(min(CHUNK,rem))
-                if not c: break
-                rem -= len(c)
-            return
+        IMPORTANT: This runs inside asyncio.create_task() — unhandled exceptions
+        would be silently swallowed. Every code path explicitly calls _xfer_log
+        so errors always surface in the TUI or terminal.
 
-        aesgcm = AESGCM(key)
-
-        # Decrypt cover image filename (used for the accept prompt display name)
+        The _file_gate Event in _recv_loop is ALWAYS re-opened in the finally
+        block below, even on exception, so subsequent transfers can proceed.
+        """
         try:
-            fn_raw    = base64.b64decode(fn_b64)
-            cover_name = aesgcm.decrypt(fn_raw[:12], fn_raw[12:], None).decode()
-            cover_name = os.path.basename(cover_name)
-        except:
-            cover_name = disp_name or f"stego_{int(time.time())}.png"
+            await self._receive_file_impl(meta)
+        except Exception as e:
+            log.exception("_receive_file crashed: %s", e)
+            self._xfer_log(f"✗ Internal receive error: {e}", err=True)
+        finally:
+            # Re-open the gate so _recv_loop can readline() for the next message.
+            self._file_gate.set()
 
-        # Decrypt the HIDDEN CONTENT name (the actual file to extract)
-        # BUG FIX: this is what gets saved, not the cover name
-        hidden_name = None
-        if hn_b64:
+    async def _receive_file_impl(self, meta):
+        from_id   = meta["from_id"];    from_name = meta["from_name"]
+        size      = int(meta["size"]); fhash     = meta.get("hash","")
+        fn_b64    = meta.get("filename_enc","")
+        is_steg   = meta.get("steg", False)
+        disp_name = meta.get("display_name","file")
+        xfer_id   = meta.get("transfer_id", os.urandom(8).hex())
+
+        log.info("Incoming %s from %s  size=%d  steg=%s",
+                 disp_name, from_name, size, is_steg)
+
+        # ── Get shared key ────────────────────────────────────
+        key    = await self.get_shared_key(from_id)
+        aesgcm = AESGCM(key) if key else None
+
+        # Decrypt cover/display name for the accept prompt
+        cover_name = disp_name
+        if aesgcm and fn_b64:
             try:
-                hn_raw      = base64.b64decode(hn_b64)
-                hidden_name = aesgcm.decrypt(hn_raw[:12], hn_raw[12:], None).decode()
-                hidden_name = os.path.basename(hidden_name)
-            except:
-                hidden_name = None
+                fn_raw     = base64.b64decode(fn_b64)
+                cover_name = aesgcm.decrypt(fn_raw[:12], fn_raw[12:], None).decode()
+                cover_name = os.path.basename(cover_name)
+            except Exception as e:
+                log.debug("Could not decrypt cover name: %s", e)
 
-        # Accept / reject prompt
-        # Show the hidden content name in the prompt, not the stego PNG name
-        if is_steg and steg_type == "file" and hidden_name:
-            prompt_name = f"{hidden_name} (hidden inside {cover_name})"
-        elif is_steg and steg_type == "msg":
-            prompt_name = f"hidden message (inside {cover_name})"
-        else:
-            try:
-                fn_raw2   = base64.b64decode(fn_b64)
-                prompt_name = aesgcm.decrypt(fn_raw2[:12], fn_raw2[12:], None).decode()
-                prompt_name = os.path.basename(prompt_name)
-            except:
-                prompt_name = disp_name
+        prompt_name = (
+            f"stego image: {cover_name}  [decode with steg password]"
+            if is_steg else cover_name
+        )
 
+        # ── Accept prompt ─────────────────────────────────────
         accepted = await self._prompt_accept(xfer_id, from_name, prompt_name, size)
 
         if not accepted:
+            # Drain the bytes so the stream stays in sync
+            log.info("Transfer rejected — draining %d bytes", size)
             rem = size
             while rem > 0:
-                c = await self.reader.read(min(CHUNK, rem))
+                try:
+                    c = await asyncio.wait_for(
+                        self.reader.read(min(CHUNK, rem)), timeout=30)
+                except asyncio.TimeoutError:
+                    log.warning("Drain timeout after rejection")
+                    break
                 if not c: break
                 rem -= len(c)
-            self._xfer_log(f"  ✗ Rejected transfer from {from_name}")
+            self._xfer_log(f"✗ Rejected transfer from {from_name}")
             return
 
+        # ── Read the incoming bytes ───────────────────────────
         if is_steg:
-            # ── Receive stego PNG and extract hidden content ──────────────────
+            # ── Stego PNG receive ─────────────────────────────
+            log.info("Reading stego PNG: %d bytes expected", size)
             data = b""; rem = size
             while rem > 0:
-                c = await self.reader.read(min(CHUNK,rem))
-                if not c: break
+                try:
+                    c = await asyncio.wait_for(
+                        self.reader.read(min(CHUNK, rem)), timeout=60)
+                except asyncio.TimeoutError:
+                    self._xfer_log(
+                        f"✗ Stego receive timeout at {len(data)}/{size} bytes", err=True)
+                    return
+                if not c:
+                    self._xfer_log(
+                        f"✗ Connection closed mid-receive ({len(data)}/{size} bytes)", err=True)
+                    return
                 data += c; rem -= len(c)
-                # In CLI mode show progress; TUI mode this is invisible (OK)
-                print(f"\r  Receiving stego image … {len(data)} bytes  ", end="", flush=True)
+                print(f"\r  Receiving stego PNG … {len(data)}/{size} bytes  ",
+                      end="", flush=True)
             print()
 
-            if fhash and not hmac.compare_digest(hashlib.sha256(data).hexdigest(), fhash):
-                self._xfer_log("  ⚠  Image hash mismatch — possible corruption", err=True)
+            log.info("Stego PNG received: %d bytes", len(data))
 
-            # Extract and decrypt
-            try:
-                enc_data = steg_extract(data)
-                payload  = decrypt_payload(enc_data, key)
-            except Exception as e:
-                self._xfer_log(f"  ✗ Steg extract/decrypt failed: {e}", err=True)
-                # Save the raw stego PNG so user can inspect it
-                raw_save = f"stego_raw_{int(time.time())}.png"
-                open(raw_save,"wb").write(data)
-                self._xfer_log(f"  Raw PNG saved to {raw_save} for inspection")
+            if len(data) != size:
+                self._xfer_log(
+                    f"✗ Stego size mismatch: expected {size}, got {len(data)}", err=True)
                 return
 
-            if steg_type == "msg":
-                # Hidden text message — display it, don't save to disk
-                text = payload.decode("utf-8", errors="replace")
-                self._xfer_log(f"  ✉  Hidden message from {from_name}:")
-                self._xfer_log(f"  \"{text}\"")
+            # Integrity check on the PNG itself
+            if fhash:
+                got = hashlib.sha256(data).hexdigest()
+                if not hmac.compare_digest(got, fhash):
+                    self._xfer_log("⚠ Stego image hash mismatch — image may be corrupt", err=True)
+                else:
+                    log.info("Stego PNG hash OK ✓")
 
-                # Tell TUI about this (uses the special callback)
-                if self._on_steg_received:
-                    self._on_steg_received(
-                        saved_path  = None,
-                        size        = len(payload),
-                        from_name   = from_name,
-                        steg_type   = "msg",
-                        message_text= text,
-                    )
-                self._history.append({
-                    "dir":"received","ts":time.time(),
-                    "filename":"(hidden message)","size":len(payload),"from":from_name
-                })
-
-            else:
-                # Hidden file — save it with the CORRECT original filename
-                # Use hidden_name if available, else fall back to cover name
-                save = hidden_name or cover_name or f"extracted_{int(time.time())}"
-
-                # Avoid overwriting existing files
-                base_, ext = os.path.splitext(save); n = 1
-                while os.path.exists(save):
-                    save = f"{base_}_{n}{ext}"; n += 1
-
-                open(save,"wb").write(payload)
-                saved_path = os.path.abspath(save)
-
+            # Create received_steg/ directory — do this BEFORE trying to save
+            try:
+                os.makedirs(STEG_RECV_DIR, exist_ok=True)
+                log.info("Save directory: %s", STEG_RECV_DIR)
+            except Exception as e:
                 self._xfer_log(
-                    f"  ✓ Hidden file extracted → {saved_path}  ({len(payload)} bytes)"
-                )
+                    f"✗ Cannot create received_steg/ directory: {e}\n"
+                    f"  Check write permissions for: {os.path.dirname(STEG_RECV_DIR)}",
+                    err=True)
+                return
 
-                # Notify TUI
-                if self._on_steg_received:
-                    self._on_steg_received(
-                        saved_path   = saved_path,
-                        size         = len(payload),
-                        from_name    = from_name,
-                        steg_type    = "file",
-                        message_text = None,
-                    )
+            # Build save filename: <cover_base>_<from_name>_<timestamp>.steg.png
+            base = os.path.splitext(cover_name)[0] if cover_name else "stego"
+            ts   = time.strftime("%Y%m%d_%H%M%S")
+            save = os.path.join(STEG_RECV_DIR, f"{base}_{from_name}_{ts}.steg.png")
+            n = 1
+            while os.path.exists(save):
+                save = os.path.join(STEG_RECV_DIR, f"{base}_{from_name}_{ts}_{n}.steg.png")
+                n += 1
 
-                self._history.append({
-                    "dir":"received","ts":time.time(),
-                    "filename":save,"size":len(payload),"from":from_name
-                })
+            # Save the raw stego PNG
+            try:
+                with open(save, "wb") as f:
+                    f.write(data)
+                saved_path = os.path.abspath(save)
+                log.info("Stego PNG saved: %s", saved_path)
+            except Exception as e:
+                self._xfer_log(
+                    f"✗ Failed to save stego PNG: {e}\n  Path attempted: {save}",
+                    err=True)
+                return
 
-                # Auto-extract zips
-                if save.endswith(".zip"):
-                    out = save[:-4]
-                    try:
-                        with zipfile.ZipFile(save) as z: z.extractall(out)
-                        self._xfer_log(f"  ✓ Extracted → {out}/")
-                    except: pass
+            # Verify the file was actually written
+            if not os.path.exists(saved_path) or os.path.getsize(saved_path) == 0:
+                self._xfer_log(
+                    f"✗ Save verification failed — file is missing or empty: {saved_path}",
+                    err=True)
+                return
+
+            # Success message — this MUST appear in the TUI or terminal
+            self._xfer_log(
+                f"🖼  Stego PNG saved  →  {saved_path}  ({len(data)} bytes)\n"
+                f"    Steg tab (F4) → DECODE → enter password to extract"
+            )
+
+            # Notify TUI (auto-fills decode path, switches to Steg tab)
+            if self._on_stego_saved:
+                try:
+                    self._on_stego_saved(saved_path, from_name, len(data))
+                except Exception as e:
+                    log.warning("_on_stego_saved callback error: %s", e)
+
+            self._history.append({
+                "dir":"received","ts":time.time(),
+                "filename":saved_path,"size":len(data),"from":from_name,"steg":True
+            })
 
         else:
-            # ── Normal streaming file ─────────────────────────────────────────
-            # Decrypt the actual filename for saving
+            # ── Normal encrypted file receive ─────────────────
+            if not aesgcm:
+                self._xfer_log(f"✗ No shared key for {from_name} — cannot decrypt", err=True)
+                rem = size
+                while rem > 0:
+                    c = await self.reader.read(min(CHUNK,rem))
+                    if not c: break
+                    rem -= len(c)
+                return
+
             try:
-                fn_raw2 = base64.b64decode(fn_b64)
-                fname   = aesgcm.decrypt(fn_raw2[:12], fn_raw2[12:], None).decode()
+                fn_raw  = base64.b64decode(fn_b64)
+                fname   = aesgcm.decrypt(fn_raw[:12], fn_raw[12:], None).decode()
                 fname   = os.path.basename(fname)
             except:
                 fname = f"received_{int(time.time())}"
 
             save = fname
-            base_, ext = os.path.splitext(fname); n = 1
-            while os.path.exists(save):
-                save = f"{base_}_{n}{ext}"; n += 1
+            b_, e_ = os.path.splitext(fname); n = 1
+            while os.path.exists(save): save = f"{b_}_{n}{e_}"; n += 1
 
-            try: salt = await self.reader.readexactly(32)
-            except asyncio.IncompleteReadError: return
+            try:
+                salt = await self.reader.readexactly(32)
+            except asyncio.IncompleteReadError:
+                self._xfer_log("✗ Transfer interrupted (salt missing)", err=True); return
+
             xfer_key = HKDF(algorithm=SHA256(), length=32, salt=salt, info=b"xfer").derive(key)
             xfer_gcm = AESGCM(xfer_key); remaining = size - 32; received = 0
+
             try:
                 with open(save,"wb") as f:
                     while remaining > 0:
@@ -896,14 +875,25 @@ class RelayClient:
                         remaining -= 4; flen = min(flen, remaining)
                         frame = await self.reader.readexactly(flen); remaining -= flen
                         try:    plain = xfer_gcm.decrypt(frame[:12], frame[12:], None)
-                        except: return
+                        except Exception as e:
+                            self._xfer_log(f"✗ Chunk decrypt failed at {received} bytes: {e}", err=True)
+                            return
                         f.write(plain); received += len(plain)
                         print(f"\r  Receiving {fname} … {received} bytes  ", end="", flush=True)
-            except asyncio.IncompleteReadError: return
+            except asyncio.IncompleteReadError:
+                self._xfer_log(f"✗ Transfer cut at {received} bytes", err=True); return
             print()
+
+            saved_path = os.path.abspath(save)
             if fhash:
                 ok = hmac.compare_digest(sha256_file(save), fhash)
-                self._xfer_log(f"  ✓ Saved → {os.path.abspath(save)}  [{'SHA-256 OK ✓' if ok else 'HASH MISMATCH ⚠'}]")
+                self._xfer_log(
+                    f"Saved → {saved_path}  [{'SHA-256 OK ✓' if ok else 'HASH MISMATCH ⚠'}]",
+                    err=not ok
+                )
+            else:
+                self._xfer_log(f"Saved → {saved_path}")
+
             self._history.append({
                 "dir":"received","ts":time.time(),
                 "filename":save,"size":received,"from":from_name
@@ -912,7 +902,7 @@ class RelayClient:
                 out = save[:-4]
                 try:
                     with zipfile.ZipFile(save) as z: z.extractall(out)
-                    self._xfer_log(f"  ✓ Extracted → {out}/")
+                    self._xfer_log(f"Extracted → {out}/")
                 except: pass
 
     async def _receive_message(self, msg):
@@ -933,27 +923,39 @@ class RelayClient:
             print(f"\n  ✗ Decrypt from {from_name}: {e}")
 
 
-# ── CLI (terminal mode) ───────────────────────────────────────────────────────
+# ── CLI ───────────────────────────────────────────────────────────────────────
 
 async def cli_loop(client: RelayClient):
     loop = asyncio.get_event_loop()
-    comp = Completer(client)
-    rl.set_completer(comp.complete); rl.set_completer_delims(" \t")
-    rl.parse_and_bind("tab: complete")
+    if _HAS_READLINE and rl is not None:
+        comp = Completer(client)
+        rl.set_completer(comp.complete)
+        rl.set_completer_delims(" \t")
+        try:
+            rl.parse_and_bind("tab: complete")      # Linux/macOS GNU readline
+        except Exception:
+            pass                                      # pyreadline3 may differ
     def readline(p=""):
         try:    return input(p)
         except: return None
-    print("\n  list | myid | send <id> <path> | steg <id> <cover> <file>")
-    print("  stegmsg <id> <cover> <text> | chat <id> | msg <id> <text>")
-    print("  alias <n> <id> | aliases | history | exit\n")
+
+    print(f"\n  Received stego PNGs → {STEG_RECV_DIR}")
+    print("  list | myid | send <id> <path>")
+    print("  steg    <id> <cover> <file>    <password>  — hide a file")
+    print("  stegmsg <id> <cover> <message> <password>  — hide a message")
+    print("  stegdecode <stego.png>          <password>  — extract hidden content")
+    print("  chat <id> | msg <id> <text> | history | exit\n")
+
     while True:
         line = await loop.run_in_executor(None, readline, "> ")
         if line is None: break
-        parts = line.strip().split(None, 3)
+        parts = line.strip().split(None, 4)
         if not parts: continue
         cmd = parts[0].lower()
+
         if cmd == "exit": break
         elif cmd == "myid": print(f"  {client.my_id}")
+
         elif cmd == "list":
             await client._send({"type":"list"}); await asyncio.sleep(0.3)
             if client.peers:
@@ -961,28 +963,64 @@ async def cli_loop(client: RelayClient):
                 for pid, pname in client.peers.items():
                     print(f"  {pid:<12}  {id2al.get(pid,''):<14}  {pname}")
             else: print("  (no peers online)")
+
         elif cmd == "send":
             if len(parts) < 3: print("  send <id/alias> <path>"); continue
             await client.send_file(resolve(parts[1]), parts[2])
+
         elif cmd == "steg":
-            if len(parts) < 4: print("  steg <id/alias> <cover_image> <file_to_hide>"); continue
-            if not os.path.isfile(parts[3]): print(f"  ✗ Not found: {parts[3]}"); continue
-            try: await client.send_steg(resolve(parts[1]), parts[2],
-                                        open(parts[3],"rb").read(), label=os.path.basename(parts[3]))
+            if len(parts) < 5:
+                print("  steg <id/alias> <cover_image> <file_to_hide> <password>"); continue
+            cover, fp, pw = parts[2], parts[3], parts[4]
+            if not os.path.isfile(cover): print(f"  ✗ Cover not found: {cover}"); continue
+            if not os.path.isfile(fp):    print(f"  ✗ File not found: {fp}"); continue
+            try:
+                payload = open(fp,"rb").read(); fname = os.path.basename(fp)
+                await client.send_steg(resolve(parts[1]), cover, payload, pw,
+                                       content_type="file", filename=fname)
+                print(f"  ✓ Sent stego PNG hiding '{fname}'")
+                print(f"  Tell receiver the steg password out-of-band!")
             except RuntimeError as e: print(f"  ✗ {e}")
+
         elif cmd == "stegmsg":
-            if len(parts) < 4: print("  stegmsg <id/alias> <cover_image> <text>"); continue
-            try: await client.send_steg(resolve(parts[1]), parts[2],
-                                        parts[3].encode(), label="message")
+            if len(parts) < 5:
+                print("  stegmsg <id/alias> <cover_image> <message> <password>"); continue
+            cover, message, pw = parts[2], parts[3], parts[4]
+            if not os.path.isfile(cover): print(f"  ✗ Cover not found: {cover}"); continue
+            try:
+                await client.send_steg(resolve(parts[1]), cover, message.encode(), pw,
+                                       content_type="msg", filename="")
+                print(f"  ✓ Sent stego PNG hiding a message")
             except RuntimeError as e: print(f"  ✗ {e}")
+
+        elif cmd == "stegdecode":
+            if len(parts) < 3:
+                print("  stegdecode <stego.png> <password>"); continue
+            stego_path, pw = parts[1], parts[2]
+            if not os.path.isfile(stego_path):
+                print(f"  ✗ Not found: {stego_path}"); continue
+            try:
+                result = steg_decode(stego_path, pw)
+                if result["content_type"] == "msg":
+                    print(f"  ✓ Hidden message:")
+                    print(f"  \"{result['payload'].decode('utf-8', errors='replace')}\"")
+                else:
+                    save = result["filename"] or f"decoded_{int(time.time())}"
+                    b_, e_ = os.path.splitext(save); n = 1
+                    while os.path.exists(save): save = f"{b_}_{n}{e_}"; n += 1
+                    open(save,"wb").write(result["payload"])
+                    print(f"  ✓ Extracted → {os.path.abspath(save)}  ({len(result['payload'])} bytes)")
+            except RuntimeError as e: print(f"  ✗ {e}")
+
         elif cmd == "msg":
             if len(parts) < 3: print("  msg <id/alias> <text>"); continue
             await client.send_message(resolve(parts[1]), " ".join(parts[2:]))
+
         elif cmd == "chat":
             if len(parts) < 2: print("  chat <id/alias>"); continue
             pid = resolve(parts[1])
             if pid not in client.peers: print(f"  ✗ {pid!r} not online"); continue
-            print(f"\n  ── Chat with {client.peers[pid]} [{pid}] ──  (Ctrl+C exits)\n")
+            print(f"\n  ── Chat with {client.peers[pid]} ──  (Ctrl+C exits)\n")
             client._chat_peer = pid
             try:
                 while True:
@@ -992,18 +1030,26 @@ async def cli_loop(client: RelayClient):
                     if text: await client.send_message(pid, text)
             except (KeyboardInterrupt, asyncio.CancelledError): pass
             finally: client._chat_peer = None; print(f"\n  ── Exited chat ──\n")
+
         elif cmd == "alias":
             if len(parts) < 3: continue
             aliases[parts[1]] = parts[2]; save_aliases(aliases)
             print(f"  Saved: {parts[1]} → {parts[2]}")
+
         elif cmd == "aliases":
             for n, pid in aliases.items(): print(f"  {n:<14}  {pid}")
+
         elif cmd == "history":
             for h in client._history[-20:]:
-                ts = time.strftime("%H:%M:%S", time.localtime(h["ts"]))
-                d  = h["dir"].upper()
-                if d == "SENT": print(f"  {ts}  {d:<8}  {h.get('size',0):>12} bytes")
-                else: print(f"  {ts}  {d:<8}  {h.get('size',0):>12} bytes  {h.get('filename','')}  ← {h.get('from','')}")
+                ts   = time.strftime("%H:%M:%S", time.localtime(h["ts"]))
+                d    = h["dir"].upper()
+                mark = " [STEG]" if h.get("steg") else ""
+                if d == "SENT":
+                    print(f"  {ts}  {d:<8}  {h.get('size',0):>12} bytes{mark}")
+                else:
+                    print(f"  {ts}  {d:<8}  {h.get('size',0):>12} bytes  "
+                          f"{h.get('filename','')}{mark}  ← {h.get('from','')}")
+
         else: print(f"  Unknown: {cmd!r}")
 
 async def run(args):
@@ -1021,7 +1067,7 @@ async def run(args):
         client = RelayClient(
             host=args.relay, port=args.port, name=args.name, secret=args.secret,
             fingerprint=args.fingerprint or None, proxy=proxy,
-            use_steg=args.steg, knock_ports=knock_ports, auto_accept=args.auto_accept,
+            knock_ports=knock_ports, auto_accept=args.auto_accept,
         )
         try:
             await client.connect(); delay = 3
@@ -1046,10 +1092,12 @@ if __name__ == "__main__":
     ap.add_argument("--knock-ports", default="", dest="knock_ports")
     ap.add_argument("--tor",         action="store_true")
     ap.add_argument("--proxy",       default="")
-    ap.add_argument("--steg",        action="store_true")
     ap.add_argument("--auto-accept", action="store_true", dest="auto_accept")
     args = ap.parse_args()
+    # ProactorEventLoop is the Windows default since Python 3.8.
+    # set_event_loop_policy() is deprecated in 3.12 and removed in 3.16 — skip it.
     try:
         asyncio.run(run(args))
     except KeyboardInterrupt:
         print("\n  Disconnected"); sys.exit(0)
+
