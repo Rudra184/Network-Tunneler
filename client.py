@@ -1,4 +1,3 @@
-
 #!/usr/bin/env python3
 """
 client.py — Secure E2E tunnel client
@@ -654,6 +653,23 @@ class RelayClient:
                     for fut in self._pubkey_wait.pop(pid,[]):
                         if not fut.done(): fut.set_result(rb)
                 elif t == "incoming_file":
+                    # Cache sender's pubkey from the inline field the server
+                    # provides.  We must not send a get_pubkey request here:
+                    # the server is already streaming file bytes to us on the
+                    # same TCP connection, so any control message response
+                    # would be interleaved with binary data, corrupting the
+                    # transfer.  The server includes from_pubkey precisely to
+                    # avoid this extra round-trip.
+                    from_id  = msg.get("from_id")
+                    fp_b64   = msg.get("from_pubkey", "")
+                    if from_id and fp_b64 and from_id not in self._pubkey_raw:
+                        try:
+                            rb = base64.b64decode(fp_b64)
+                            self._pubkey_raw[from_id] = rb
+                            for fut in self._pubkey_wait.pop(from_id, []):
+                                if not fut.done(): fut.set_result(rb)
+                        except Exception as e:
+                            log.warning("Could not cache inline pubkey for %s: %s", from_id, e)
                     # Close the gate BEFORE scheduling the task so the next
                     # await self._file_gate.wait() above blocks immediately.
                     self._file_gate.clear()
@@ -706,7 +722,18 @@ class RelayClient:
                  disp_name, from_name, size, is_steg)
 
         # ── Get shared key ────────────────────────────────────
-        key    = await self.get_shared_key(from_id)
+        # _recv_loop caches the sender's pubkey from the inline from_pubkey
+        # field before the gate closes.  Only CPU work needed here — no
+        # network requests, no deadlock risk.
+        key = self._key_cache.get(from_id)
+        if key is None and from_id in self._pubkey_raw:
+            try:
+                raw_pk = self._pubkey_raw[from_id]
+                shared = self._priv.exchange(X25519PublicKey.from_public_bytes(raw_pk))
+                key    = HKDF(algorithm=SHA256(), length=32, salt=None, info=b"e2e-key").derive(shared)
+                self._key_cache[from_id] = key
+            except Exception as e:
+                log.warning("Key derivation failed for %s: %s", from_id, e)
         aesgcm = AESGCM(key) if key else None
 
         # Decrypt cover/display name for the accept prompt
@@ -726,6 +753,12 @@ class RelayClient:
 
         # ── Accept prompt ─────────────────────────────────────
         accepted = await self._prompt_accept(xfer_id, from_name, prompt_name, size)
+
+        # Yield to the event loop so any I/O callbacks that arrived while the
+        # user was deciding (modal open) are flushed before we start reading.
+        # This avoids a race where read() returns 0 bytes on the first call
+        # because asyncio's internal read buffer hasn't been populated yet.
+        await asyncio.sleep(0)
 
         if not accepted:
             # Drain the bytes so the stream stays in sync
@@ -750,8 +783,12 @@ class RelayClient:
             data = b""; rem = size
             while rem > 0:
                 try:
+                    # Use 120s timeout per chunk — the user may have taken up
+                    # to 30s on the accept popup; the sender + server pipeline
+                    # continues independently, but the OS buffers may not have
+                    # all bytes flushed to our asyncio reader yet.
                     c = await asyncio.wait_for(
-                        self.reader.read(min(CHUNK, rem)), timeout=60)
+                        self.reader.read(min(CHUNK, rem)), timeout=120)
                 except asyncio.TimeoutError:
                     self._xfer_log(
                         f"✗ Stego receive timeout at {len(data)}/{size} bytes", err=True)
@@ -1100,4 +1137,3 @@ if __name__ == "__main__":
         asyncio.run(run(args))
     except KeyboardInterrupt:
         print("\n  Disconnected"); sys.exit(0)
-

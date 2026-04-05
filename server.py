@@ -1,4 +1,3 @@
-
 #!/usr/bin/env python3
 
 
@@ -178,6 +177,9 @@ async def relay_file(sender_id, sender_name, sender_ip, msg, reader, writer, sen
         "steg":         is_steg,
         "display_name": display_name,
         "transfer_id":  transfer_id,
+        # Inline pubkey so receiver never needs a separate get_pubkey
+        # request while file bytes are already in-flight on the stream.
+        "from_pubkey":  peers.get(sender_id, {}).get("pubkey", ""),
     }))
     await tw.drain()
 
@@ -394,4 +396,3 @@ if __name__ == "__main__":
         audit("server_stop")
         AUDIT_FILE.close()
         sys.exit(0)
-

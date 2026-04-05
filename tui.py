@@ -1,4 +1,3 @@
-
 #!/usr/bin/env python3
 """
 tui.py — Secure Tunnel TUI
@@ -601,12 +600,6 @@ class TunnelApp(App):
                 else f"{size_bytes} B"
             )
 
-            # Use asyncio.Event + a mutable result holder instead of asyncio.Future.
-            # Future.cancel() (called by asyncio.wait_for on timeout in Python 3.12+)
-            # puts the Future into a cancelled state, which makes set_result() raise
-            # InvalidStateError in on_show_accept_modal — silently resolving to False
-            # even when the user just clicked Accept a millisecond after the timeout.
-            # asyncio.Event has no such cancellation semantics.
             accepted_event  = asyncio.Event()
             accepted_result = [False]          # list so the nested callback can mutate it
 
@@ -621,6 +614,10 @@ class TunnelApp(App):
                 await asyncio.wait_for(accepted_event.wait(), timeout=35)
             except asyncio.TimeoutError:
                 pass   # accepted_result[0] stays False
+
+            if accepted_result[0]:
+                await asyncio.sleep(0)
+
             return accepted_result[0]
 
         # ── Hook 2: Stego saved (auto-fill decode path, switch tab) ──────────
@@ -917,4 +914,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
