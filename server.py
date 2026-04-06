@@ -18,7 +18,7 @@ ip_bw         = {}
 
 SECRET_BYTES   = b""
 AUDIT_FILE     = None
-KNOCK_SEQUENCE = [6132, 8152, 3101]   # default sequence
+KNOCK_SEQUENCE = [6132, 8152, 3101]   
 
 MAX_CONN      = 5
 MAX_FAILS     = 3
@@ -177,8 +177,6 @@ async def relay_file(sender_id, sender_name, sender_ip, msg, reader, writer, sen
         "steg":         is_steg,
         "display_name": display_name,
         "transfer_id":  transfer_id,
-        # Inline pubkey so receiver never needs a separate get_pubkey
-        # request while file bytes are already in-flight on the stream.
         "from_pubkey":  peers.get(sender_id, {}).get("pubkey", ""),
     }))
     await tw.drain()
@@ -349,7 +347,6 @@ async def handle_client(reader, writer):
 
 async def main(host, port, cert, key):
     ctx = build_ssl_ctx(cert, key)
-    await start_knock_listeners()
     server = await asyncio.start_server(handle_client, host, port, ssl=ctx)
     fp = cert_fingerprint(cert)
     log.info("=" * 62)
@@ -369,7 +366,7 @@ if __name__ == "__main__":
     ap.add_argument("--key",         default="relay.key")
     ap.add_argument("--audit-log",   default="audit.log")
     ap.add_argument("--knock-ports", default="6132,8152,3101",
-                    help="Comma-separated knock sequence (default: 6132,8152,3101)")
+                    help="Comma-separated knock sequence")
     args = ap.parse_args()
 
     SECRET_BYTES   = args.secret.encode()

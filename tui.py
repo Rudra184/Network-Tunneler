@@ -113,6 +113,7 @@ class AcceptModal(ModalScreen):
                 yield Button("✗  Reject", id="b-no",  variant="error")
 
     def on_button_pressed(self, e: Button.Pressed):
+        e.stop()   # prevent event bubbling to TunnelApp.on_button_pressed
         self.dismiss(e.button.id == "b-yes")
 
     def on_mount(self):
@@ -389,22 +390,28 @@ class TunnelApp(App):
         xl = self._q("#xfer-log", RichLog)
         if xl: xl.write(msg.line)
 
-    async def on_show_accept_modal(self, msg: ShowAcceptModal):
-        """Show the accept/reject dialog and fire the callback with the result.
+    def on_show_accept_modal(self, msg: ShowAcceptModal):
+        """Show the accept/reject dialog and fire msg.callback with the result.
 
-        push_screen_wait() returns whatever AcceptModal.dismiss() was given:
-          True  → user clicked Accept
-          False → user clicked Reject OR the 30 s auto-timer fired
-          None  → Textual dismissed the screen without a value (treat as reject)
-        The callback is always called exactly once so tui_prompt_accept unblocks.
+        Uses push_screen + callback (the canonical Textual pattern) instead of
+        push_screen_wait inside an async handler.  The async-handler+wait
+        approach is unreliable: if anything disturbs the screen stack while the
+        handler is suspended, push_screen_wait's internal future never resolves
+        and the except block silently calls msg.callback(False) — causing every
+        manual accept to look like a rejection.  The sync + callback pattern has
+        no such timing dependency: callback() is invoked synchronously inside
+        dismiss(), always exactly once.
         """
-        try:
-            result = await self.push_screen_wait(
-                AcceptModal(msg.from_name, msg.filename, msg.size_str, msg.tid))
+        def _screen_callback(result):
+            # Called by Textual synchronously when AcceptModal.dismiss() fires.
+            # We are inside the asyncio event loop at this point, so setting
+            # an asyncio.Event is safe.
             msg.callback(result is True)   # None / False → False
-        except Exception as exc:
-            log.warning("on_show_accept_modal error: %s", exc)
-            msg.callback(False)
+
+        self.push_screen(
+            AcceptModal(msg.from_name, msg.filename, msg.size_str, msg.tid),
+            callback=_screen_callback,
+        )
 
     def on_stego_saved(self, msg: StegoSaved):
         """
@@ -600,23 +607,29 @@ class TunnelApp(App):
                 else f"{size_bytes} B"
             )
 
+            # accepted_result is a one-element list so the nested callback can
+            # write to it from a sync context without nonlocal/closure issues.
+            accepted_result = [False]
             accepted_event  = asyncio.Event()
-            accepted_result = [False]          # list so the nested callback can mutate it
 
             def _on_modal_done(accepted: bool):
+                # Called synchronously from within AcceptModal.dismiss() via
+                # push_screen callback.  We are inside the asyncio event loop,
+                # so setting an asyncio.Event here is safe.
                 accepted_result[0] = accepted
-                accepted_event.set()           # unblocks the await below
+                accepted_event.set()
 
             app_ref.post_message(ShowAcceptModal(from_name, filename, size_str, tid, _on_modal_done))
-            try:
-                # 35 s is longer than the modal's own 30 s auto-reject timer,
-                # so in practice this timeout is just a safety net.
-                await asyncio.wait_for(accepted_event.wait(), timeout=35)
-            except asyncio.TimeoutError:
-                pass   # accepted_result[0] stays False
 
-            if accepted_result[0]:
-                await asyncio.sleep(0)
+            # Poll the event instead of asyncio.wait_for — avoids the Python
+            # 3.12+ behaviour where wait_for cancels the inner coroutine on
+            # timeout, which can race with the callback setting the event and
+            # leave accepted_result[0] as False even after the user accepted.
+            # 36 s > the modal's own 30 s auto-reject timer, so this is just
+            # a safety net; in normal use _on_modal_done fires long before.
+            deadline = time.monotonic() + 36
+            while not accepted_event.is_set() and time.monotonic() < deadline:
+                await asyncio.sleep(0.05)
 
             return accepted_result[0]
 
