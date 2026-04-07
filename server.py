@@ -2,8 +2,13 @@
 
 
 import asyncio, json, logging, argparse, sys, time, os, hmac, hashlib
-import struct, ssl, uuid
+import struct, ssl, uuid, base64
 from collections import defaultdict
+try:
+    from tunnel import ServerTunnelManager
+    _server_tun = ServerTunnelManager()
+except ImportError:
+    _server_tun = None
 
 logging.basicConfig(level=logging.INFO,
     format="%(asctime)s  %(levelname)-7s  %(message)s", datefmt="%H:%M:%S")
@@ -18,7 +23,7 @@ ip_bw         = {}
 
 SECRET_BYTES   = b""
 AUDIT_FILE     = None
-KNOCK_SEQUENCE = [6132, 8152, 3101]   
+KNOCK_SEQUENCE = [6132, 8152, 3101]   # default sequence
 
 MAX_CONN      = 5
 MAX_FAILS     = 3
@@ -177,6 +182,8 @@ async def relay_file(sender_id, sender_name, sender_ip, msg, reader, writer, sen
         "steg":         is_steg,
         "display_name": display_name,
         "transfer_id":  transfer_id,
+        # Inline pubkey so receiver never needs a separate get_pubkey
+        # request while file bytes are already in-flight on the stream.
         "from_pubkey":  peers.get(sender_id, {}).get("pubkey", ""),
     }))
     await tw.drain()
@@ -328,6 +335,69 @@ async def handle_client(reader, writer):
             elif t == "ping":
                 await send({"type": "pong"})
 
+            elif t == "tunnel_start":
+                if _server_tun is None:
+                    await send({"type": "tunnel_error", "msg": "tunnel module not available"})
+                else:
+                    try:
+                        await _server_tun.ensure_started(SECRET_BYTES)
+                        client_tun_ip = _server_tun.assign_client(
+                            peer_id, writer, SECRET_BYTES)
+                        await send({"type": "tunnel_ready",
+                                    "client_ip": client_tun_ip,
+                                    "server_tun_ip": "10.8.0.1"})
+                        audit("tunnel_start", peer_id=peer_id, ip=client_tun_ip)
+                        log.info("Tunnel started for %s → %s", peer_id, client_tun_ip)
+                    except Exception as e:
+                        await send({"type": "tunnel_error", "msg": str(e)})
+
+            elif t == "tpkt":
+                # Encrypted tunnel packet — decrypted per-client inside handle_client_packet
+                if _server_tun and peer_id in (_server_tun._ip_pool or {}):
+                    _server_tun.handle_client_packet(peer_id, msg.get("d", ""))
+
+            elif t == "tunnel_stop":
+                if _server_tun:
+                    _server_tun.release_client(peer_id)
+                    audit("tunnel_stop", peer_id=peer_id)
+                    log.info("Tunnel stopped for %s", peer_id)
+
+            elif t == "tunnel_pcap":
+                # Admin toggles packet capture (only works when tunnel is active)
+                if _server_tun and _server_tun._started:
+                    enable = msg.get("enable", False)
+                    if enable:
+                        path = msg.get("path", f"capture_{int(time.time())}.pcap")
+                        _server_tun.start_pcap(path)
+                        await send({"type": "tunnel_pcap_ack", "ok": True, "path": path})
+                    else:
+                        _server_tun.stop_pcap()
+                        await send({"type": "tunnel_pcap_ack", "ok": True, "path": ""})
+                else:
+                    await send({"type": "tunnel_pcap_ack", "ok": False,
+                                "msg": "Tunnel not active"})
+
+            elif t == "socks":
+                # Relay SOCKS5 control messages between peers (peer-to-peer, like "msg")
+                tid = msg.get("to")
+                if tid in peers:
+                    peers[tid]["writer"].write(enc({
+                        "type":      "socks",
+                        "from_id":   peer_id,
+                        "from_name": name,
+                        "action":    msg.get("action", ""),
+                        "sid":       msg.get("sid", ""),
+                        "host":      msg.get("host", ""),
+                        "port":      msg.get("port", 0),
+                        "ok":        msg.get("ok", False),
+                        "reason":    msg.get("reason", ""),
+                        "d":         msg.get("d", ""),
+                    }))
+                    try: await peers[tid]["writer"].drain()
+                    except: pass
+                else:
+                    await send({"type": "error", "msg": "SOCKS target not connected"})
+
             else:
                 await send({"type": "error", "msg": f"Unknown type {t!r}"})
 
@@ -337,6 +407,8 @@ async def handle_client(reader, writer):
         log.exception("id=%s: %s", peer_id, e)
     finally:
         peers.pop(peer_id, None)
+        if _server_tun:
+            _server_tun.release_client(peer_id)
         ip_conn_count[ip] = max(0, ip_conn_count[ip] - 1)
         writer.close()
         log.info("Disconnected  id=%-8s  name=%s", peer_id, name)
@@ -366,7 +438,7 @@ if __name__ == "__main__":
     ap.add_argument("--key",         default="relay.key")
     ap.add_argument("--audit-log",   default="audit.log")
     ap.add_argument("--knock-ports", default="6132,8152,3101",
-                    help="Comma-separated knock sequence")
+                    help="Comma-separated knock sequence (default: 6132,8152,3101)")
     args = ap.parse_args()
 
     SECRET_BYTES   = args.secret.encode()

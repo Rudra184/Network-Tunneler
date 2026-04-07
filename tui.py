@@ -198,6 +198,12 @@ class TunnelApp(App):
     #inp-alias-id   { height: 3; margin-bottom: 1; }
     #btn-save-alias { margin-bottom: 1; }
     #alias-log { height: 1fr; border: solid $panel; padding: 0 1; }
+    #tun-card   { border: solid $warning; padding: 1 2; margin-bottom: 1; height: auto; }
+    #tun-status { height: 2; margin-top: 1; }
+    #btn-tunnel   { width: 26; }
+    #socks-card   { border: solid $primary; padding: 1 2; margin-bottom: 1; height: auto; }
+    #socks-status { height: 2; margin-top: 1; }
+    #btn-socks    { width: 26; }
     """
 
     BINDINGS = [
@@ -211,6 +217,8 @@ class TunnelApp(App):
 
     connected     = reactive(False)
     selected_peer = reactive("")
+    tunnel_active = reactive(False)
+    socks_active  = reactive(False)
 
     def __init__(self, args):
         super().__init__()
@@ -224,6 +232,7 @@ class TunnelApp(App):
         self._use_tor     = getattr(args,"tor",False)
         self._proxy       = getattr(args,"proxy","")
         self._auto_accept = getattr(args,"auto_accept",False)
+        self._tunnel_error: str = ""
 
     def compose(self) -> ComposeResult:
         yield Header(show_clock=True)
@@ -277,6 +286,25 @@ class TunnelApp(App):
                                 yield Label("Auto-accept incoming files")
                                 yield Switch(value=self._auto_accept, id="sw-aa")
                             yield Static("When OFF: popup lets you accept or reject each transfer.", classes="desc")
+                        with Vertical(id="tun-card"):
+                            yield Label("🌐  Traffic Tunnel", classes="card-title")
+                            yield Static(
+                                "Routes ALL device traffic through the relay server.\n"
+                                "Requires root/sudo on both ends.  Linux only.", classes="desc")
+                            yield Button("⬤  Enable Tunnel", id="btn-tunnel", variant="warning")
+                            yield Label("", id="tun-status")
+                        with Vertical(id="socks-card"):
+                            yield Label("🧦  SOCKS5 Proxy", classes="card-title")
+                            yield Static(
+                                "Proxy apps through a peer's internet connection.\n"
+                                "Point app at 127.0.0.1:1080 as SOCKS5 proxy.\n"
+                                "E2E encrypted — relay server sees nothing.", classes="desc")
+                            with Vertical(classes="field"):
+                                yield Label("Local port")
+                                yield Input(value="1080", placeholder="1080", id="i-socks-port")
+                            yield Label("Exit peer: select in sidebar", id="socks-peer-lbl", classes="muted")
+                            yield Button("⬤  Start SOCKS5", id="btn-socks", variant="primary")
+                            yield Label("", id="socks-status")
                         yield Rule()
                         with Horizontal(id="stg-btns"):
                             yield Button("⚡  Connect",    id="btn-connect",    variant="success")
@@ -524,6 +552,9 @@ class TunnelApp(App):
                 self._restore_chat(pid)
             else: w.update("← Click a peer in the sidebar to chat")
         txt = self._peer_display()
+        lbl_s = self._q("#socks-peer-lbl", Label)
+        if lbl_s: lbl_s.update(
+            f"Exit peer: [bold]{txt}[/bold]" if pid else "Exit peer: select in sidebar")
         for sel in ("#f-to","#enc-to"):
             lbl = self._q(sel, Label)
             if lbl: lbl.update(f"To: [bold]{txt}[/bold]" if pid else "To: (select peer in sidebar)")
@@ -542,7 +573,9 @@ class TunnelApp(App):
         bid = e.button.id or ""
         if bid.startswith(_PEER_BTN_PREFIX):
             self.selected_peer = bid[len(_PEER_BTN_PREFIX):]; return
-        if   bid == "btn-connect":    self._read_settings(); await self._do_connect()
+        if   bid == "btn-socks":      await self._toggle_socks()
+        elif bid == "btn-tunnel":     await self._toggle_tunnel()
+        elif bid == "btn-connect":    self._read_settings(); await self._do_connect()
         elif bid == "btn-disconnect": await self._disconnect()
         elif bid == "btn-csend":      await self._send_chat()
         elif bid == "btn-fsend":      await self._send_file()
@@ -645,10 +678,34 @@ class TunnelApp(App):
             col = "red" if is_err else "green"
             app_ref.post_message(XferLog(f"[{ts}] [{col}]{msg_str}[/{col}]"))
 
+        # ── Hook 4: Tunnel status ──────────────────────────────────────
+        def on_tunnel_status(msg_str: str, is_err: bool):
+            app_ref.tunnel_active = (not is_err and "active" in msg_str)
+            lbl = app_ref._q("#tun-status", Label)
+            col = "red" if is_err else "green"
+            if lbl: lbl.update(f"[{col}]{msg_str}[/{col}]")
+            ts = datetime.now().strftime("%H:%M")
+            app_ref.post_message(XferLog(f"[{ts}] [{col}]{msg_str}[/{col}]"))
+
         # Set all hooks BEFORE connect() — this is critical
         self._client._prompt_accept    = tui_prompt_accept
         self._client._on_stego_saved   = on_stego_saved
         self._client._on_xfer_status   = on_xfer_status
+        self._client._on_tunnel_status = on_tunnel_status
+
+        def on_socks_status(msg_str: str, is_err: bool):
+            app_ref.socks_active = (not is_err and "active" in msg_str)
+            lbl = app_ref._q("#socks-status", Label)
+            col = "red" if is_err else "green"
+            if lbl: lbl.update(f"[{col}]{msg_str}[/{col}]")
+
+        def on_pcap_ack(ok: bool, info: str):
+            ts  = datetime.now().strftime("%H:%M")
+            col = "green" if ok else "red"
+            app_ref.post_message(XferLog(f"[{ts}] [{col}]PCAP: {info}[/{col}]"))
+
+        self._client._on_socks_status = on_socks_status
+        self._client._on_pcap_ack     = on_pcap_ack
 
         try:
             await self._client.connect()
@@ -662,6 +719,16 @@ class TunnelApp(App):
         self._msg_task = asyncio.create_task(self._intercept_callbacks())
 
     async def _disconnect(self):
+        if self._client and getattr(self._client, "_socks", None):
+            try: await self._client.stop_socks()
+            except: pass
+        self.socks_active = False
+        if self._client and getattr(self._client, "_tunnel", None):
+            try:
+                await self._client.stop_tunnel()
+            except Exception:
+                pass
+        self.tunnel_active = False
         if self._msg_task: self._msg_task.cancel(); self._msg_task = None
         if self._client:
             try: await self._client.disconnect()
@@ -725,6 +792,79 @@ class TunnelApp(App):
 
         while self.connected and self._client:
             await asyncio.sleep(5.0)
+
+    # ── tunnel ───────────────────────────────────────────────
+
+    def watch_tunnel_active(self, val: bool):
+        btn = self._q("#btn-tunnel", Button)
+        if not btn: return
+        if val:
+            btn.label   = "⬛  Disable Tunnel"
+            btn.variant = "error"
+        else:
+            btn.label   = "⬤  Enable Tunnel"
+            btn.variant = "warning"
+
+    async def _toggle_tunnel(self):
+        if not self.connected or not self._client:
+            self._stg_msg("Connect first before enabling the tunnel", err=True)
+            return
+        lbl    = self._q("#tun-status", Label)
+        tunnel = getattr(self._client, "_tunnel", None)
+        if tunnel and tunnel.active:
+            if lbl: lbl.update("[yellow]Stopping tunnel …[/yellow]")
+            try:
+                await self._client.stop_tunnel()
+                self.tunnel_active = False
+                if lbl: lbl.update("[green]Tunnel stopped — routes restored ✓[/green]")
+            except Exception as e:
+                if lbl: lbl.update(f"[red]Stop failed: {e}[/red]")
+        else:
+            if lbl: lbl.update("[yellow]Requesting tunnel from server …[/yellow]")
+            try:
+                await self._client.start_tunnel()
+                # Status update arrives via on_tunnel_status callback
+            except Exception as e:
+                if lbl: lbl.update(f"[red]{e}[/red]")
+
+    # ── socks ────────────────────────────────────────────────
+
+    def watch_socks_active(self, val: bool):
+        btn = self._q("#btn-socks", Button)
+        if not btn: return
+        if val:
+            btn.label   = "⬛  Stop SOCKS5"
+            btn.variant = "error"
+        else:
+            btn.label   = "⬤  Start SOCKS5"
+            btn.variant = "primary"
+
+    async def _toggle_socks(self):
+        if not self.connected or not self._client:
+            self._stg_msg("Connect first", err=True); return
+        lbl   = self._q("#socks-status", Label)
+        socks = getattr(self._client, "_socks", None)
+        if socks and socks.active:
+            if lbl: lbl.update("[yellow]Stopping SOCKS5 …[/yellow]")
+            try:
+                await self._client.stop_socks()
+                self.socks_active = False
+                if lbl: lbl.update("[green]SOCKS5 stopped ✓[/green]")
+            except Exception as e:
+                if lbl: lbl.update(f"[red]{e}[/red]")
+        else:
+            if not self.selected_peer:
+                if lbl: lbl.update("[red]Select an exit peer in the sidebar first[/red]")
+                return
+            try:
+                port = int(self._val("#i-socks-port") or "1080")
+            except ValueError:
+                port = 1080
+            if lbl: lbl.update("[yellow]Starting SOCKS5 …[/yellow]")
+            try:
+                await self._client.start_socks(self.selected_peer, port)
+            except Exception as e:
+                if lbl: lbl.update(f"[red]{e}[/red]")
 
     # ── chat ──────────────────────────────────────────────────
 

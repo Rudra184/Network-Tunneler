@@ -60,6 +60,11 @@ except ImportError:
     except ImportError:
         rl = None                          # no completion — still works fine
 
+try:
+    from tunnel import ClientTunnelManager, Socks5Server
+except ImportError:
+    ClientTunnelManager = None; Socks5Server = None
+
 from cryptography.hazmat.primitives.asymmetric.x25519 import X25519PrivateKey, X25519PublicKey
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from cryptography.hazmat.primitives.serialization import Encoding, PublicFormat
@@ -413,6 +418,16 @@ class RelayClient:
         self._on_stego_saved = None
         # _on_xfer_status(message: str, is_error: bool)
         self._on_xfer_status = None
+        # _on_tunnel_status(message: str, is_error: bool)
+        self._on_tunnel_status = None
+
+        # Traffic tunnel state
+        self._tunnel : object = None   # ClientTunnelManager when active
+        self._socks  : object = None   # Socks5Server when active
+        # _on_socks_status(msg, is_err)
+        self._on_socks_status = None
+        # _on_pcap_ack(ok, path_or_msg)
+        self._on_pcap_ack = None
 
     def _xfer_log(self, msg: str, err: bool = False):
         """Route a status message to TUI callback or print()."""
@@ -465,6 +480,20 @@ class RelayClient:
         self._task = asyncio.create_task(self._recv_loop())
 
     async def disconnect(self):
+        if self._socks:
+            try: await self._socks.stop()
+            except: pass
+            self._socks = None
+        if self._tunnel:
+            try:
+                await self._send({"type": "tunnel_stop"})
+            except Exception:
+                pass
+            try:
+                await self._tunnel.stop()
+            except Exception:
+                pass
+            self._tunnel = None
         if self._task: self._task.cancel()
         if self.writer:
             self.writer.close()
@@ -682,10 +711,159 @@ class RelayClient:
                 elif t == "error":
                     self._xfer_log(f"Relay error: {msg.get('msg','')}", err=True)
                     self._xfer_done.set()
+                elif t == "tunnel_ready":
+                    asyncio.create_task(self._on_tunnel_ready(msg))
+                elif t == "tunnel_error":
+                    emsg = msg.get("msg", "unknown error")
+                    log.warning("Tunnel error from server: %s", emsg)
+                    if self._on_tunnel_status:
+                        self._on_tunnel_status(f"✗ Tunnel error: {emsg}", True)
+                elif t == "tpkt":
+                    # Encrypted inbound tunnel packet from server
+                    if self._tunnel and self._tunnel.active:
+                        self._tunnel.inject(msg.get("d", ""))
+                elif t == "socks":
+                    asyncio.create_task(self._handle_socks_msg(msg))
+                elif t == "tunnel_pcap_ack":
+                    if self._on_pcap_ack:
+                        ok   = msg.get("ok", False)
+                        info = msg.get("path","") or msg.get("msg","")
+                        self._on_pcap_ack(ok, info)
         except (asyncio.IncompleteReadError, ConnectionResetError, BrokenPipeError):
             log.warning("Connection lost")
         except asyncio.CancelledError: pass
         except Exception as e: log.exception("Recv loop: %s", e)
+
+    # ── traffic tunnel ───────────────────────────────────────
+
+    async def start_tunnel(self):
+        """Request a traffic tunnel from the relay server."""
+        if ClientTunnelManager is None:
+            raise RuntimeError("tunnel.py not found — place it alongside client.py")
+        if self._tunnel and self._tunnel.active:
+            raise RuntimeError("Tunnel already active")
+        if not self.writer:
+            raise RuntimeError("Not connected")
+        await self._send({"type": "tunnel_start"})
+        # Response handled in recv_loop → _on_tunnel_ready
+
+    async def stop_tunnel(self):
+        """Tear down the traffic tunnel."""
+        if self._tunnel and self._tunnel.active:
+            try:
+                await self._send({"type": "tunnel_stop"})
+            except Exception:
+                pass
+            await self._tunnel.stop()
+            self._tunnel = None
+            if self._on_tunnel_status:
+                self._on_tunnel_status("Tunnel stopped — routes restored", False)
+
+    async def _on_tunnel_ready(self, msg: dict):
+        """Called when server confirms tunnel_ready with assigned IP."""
+        client_ip = msg.get("client_ip", "")
+        if not client_ip:
+            if self._on_tunnel_status:
+                self._on_tunnel_status("✗ Tunnel: server sent no client IP", True)
+            return
+        if ClientTunnelManager is None:
+            return
+        try:
+            tun = ClientTunnelManager()
+
+            def _send_pkt(blob_b64: str):
+                # blob_b64 is already encrypted by ClientTunnelManager._read_loop
+                # Write as a short JSON line — no drain() call here to avoid
+                # creating a coroutine from a sync context.  The StreamWriter
+                # buffers up to 64 KB before blocking; drain() fires naturally
+                # in the next await in _recv_loop.
+                if not self.writer: return
+                try:
+                    self.writer.write(
+                        (json.dumps({"type": "tpkt", "d": blob_b64}) + "\n").encode())
+                except Exception as e:
+                    log.warning("TUN pkt send: %s", e)
+
+            tun.on_send_pkt = _send_pkt
+            await tun.start(
+                server_relay_ip=self.host,
+                assigned_ip=client_ip,
+                secret=self.secret,
+                peer_id=self.my_id or "unknown",
+            )
+            self._tunnel = tun
+            if self._on_tunnel_status:
+                self._on_tunnel_status(
+                    f"🌐 Tunnel active — all traffic via relay  (your tun IP: {client_ip})",
+                    False)
+            log.info("Traffic tunnel up: %s", client_ip)
+        except Exception as e:
+            log.exception("Tunnel start failed: %s", e)
+            if self._on_tunnel_status:
+                self._on_tunnel_status(f"✗ Tunnel failed: {e}", True)
+
+    # ── SOCKS5 proxy ─────────────────────────────────────────
+
+    async def start_socks(self, proxy_peer_id: str, local_port: int = 1080):
+        """Open a local SOCKS5 listener that exits through proxy_peer_id."""
+        if Socks5Server is None:
+            raise RuntimeError("tunnel.py not found")
+        if self._socks and self._socks.active:
+            raise RuntimeError("SOCKS5 proxy already running")
+        if proxy_peer_id not in self.peers:
+            raise RuntimeError(f"Peer {proxy_peer_id!r} not connected")
+        socks = Socks5Server()
+
+        async def _relay(action_dict: dict):
+            await self._send({
+                "type":   "socks",
+                "to":     proxy_peer_id,
+                **action_dict,
+            })
+
+        await socks.start(proxy_peer_id, _relay, local_port)
+        self._socks = socks
+        if self._on_socks_status:
+            self._on_socks_status(
+                f"🧦 SOCKS5 active on 127.0.0.1:{local_port}  exit→{proxy_peer_id}", False)
+
+    async def stop_socks(self):
+        if self._socks:
+            await self._socks.stop()
+            self._socks = None
+            if self._on_socks_status:
+                self._on_socks_status("SOCKS5 stopped", False)
+
+    async def toggle_pcap(self, enable: bool, path: str = ""):
+        """Ask the server to start/stop pcap capture (requires server-side root)."""
+        await self._send({"type": "tunnel_pcap", "enable": enable, "path": path})
+
+    async def _handle_socks_msg(self, msg: dict):
+        """
+        Dispatch an incoming socks relay message.
+        Two roles:
+          - Originator side: message is an ack/data/close from the exit peer.
+            Deliver to Socks5Server.on_relay_msg().
+          - Exit node side: message is open/data/close from originator.
+            Handle via Socks5Server.handle_as_exit() and reply back.
+        """
+        action  = msg.get("action", "")
+        from_id = msg.get("from_id", "")
+
+        if self._socks and self._socks.active and self._socks._proxy_peer == from_id:
+            # We are the originator; this is a reply from our chosen exit peer
+            await self._socks.on_relay_msg(msg)
+        else:
+            # We are the exit node — handle and reply back to originator
+            if Socks5Server is None: return
+            # Reuse or create a transient exit-role Socks5Server instance
+            if not hasattr(self, "_socks_exit"):
+                self._socks_exit = Socks5Server()
+
+            async def _reply(d: dict):
+                await self._send({"type": "socks", "to": from_id, **d})
+
+            await self._socks_exit.handle_as_exit(msg, _reply)
 
     async def _prefetch_pubkey(self, pid):
         await self.get_pubkey_raw(pid)
