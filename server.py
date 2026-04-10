@@ -16,6 +16,7 @@ log = logging.getLogger("relay")
 
 # ── Global state ──────────────────────────────────────────────────────────────
 peers         = {}
+channels      = {}               # channel_id → set(peer_id)
 ip_conn_count = defaultdict(int)
 ip_auth_fails = defaultdict(lambda: [0, 0.0])
 used_nonces   = {}
@@ -332,6 +333,39 @@ async def handle_client(reader, writer):
                 else:
                     await send({"type": "error", "msg": "Target not connected"})
 
+            elif t == "join_channel":
+                cid = msg.get("channel_id", "")[:64]
+                if cid:
+                    channels.setdefault(cid, set()).add(peer_id)
+
+            elif t == "leave_channel":
+                cid = msg.get("channel_id", "")
+                if cid in channels:
+                    channels[cid].discard(peer_id)
+                    if not channels[cid]:
+                        del channels[cid]
+
+            elif t == "channel_msg":
+                cid     = msg.get("channel_id", "")
+                payload = msg.get("payload", "")
+                nonce   = msg.get("nonce", "")
+                if cid and payload and nonce:
+                    members = channels.get(cid, set())
+                    for mid in list(members):
+                        if mid != peer_id and mid in peers:
+                            try:
+                                peers[mid]["writer"].write(enc({
+                                    "type":       "channel_msg",
+                                    "channel_id": cid,
+                                    "from_id":    peer_id,
+                                    "from_name":  name,
+                                    "payload":    payload,
+                                    "nonce":      nonce,
+                                }))
+                                await peers[mid]["writer"].drain()
+                            except Exception:
+                                pass
+
             elif t == "ping":
                 await send({"type": "pong"})
 
@@ -407,6 +441,10 @@ async def handle_client(reader, writer):
         log.exception("id=%s: %s", peer_id, e)
     finally:
         peers.pop(peer_id, None)
+        for cid in list(channels):
+            channels[cid].discard(peer_id)
+            if not channels[cid]:
+                del channels[cid]
         if _server_tun:
             _server_tun.release_client(peer_id)
         ip_conn_count[ip] = max(0, ip_conn_count[ip] - 1)

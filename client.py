@@ -428,6 +428,10 @@ class RelayClient:
         self._on_socks_status = None
         # _on_pcap_ack(ok, path_or_msg)
         self._on_pcap_ack = None
+        # _on_channel_msg(channel_id, from_name, text)
+        self._on_channel_msg = None
+        # local channel key store: channel_id → bytes
+        self._channel_keys: dict = {}
 
     def _xfer_log(self, msg: str, err: bool = False):
         """Route a status message to TUI callback or print()."""
@@ -729,6 +733,8 @@ class RelayClient:
                         ok   = msg.get("ok", False)
                         info = msg.get("path","") or msg.get("msg","")
                         self._on_pcap_ack(ok, info)
+                elif t == "channel_msg":
+                    asyncio.create_task(self._handle_channel_msg(msg))
         except (asyncio.IncompleteReadError, ConnectionResetError, BrokenPipeError):
             log.warning("Connection lost")
         except asyncio.CancelledError: pass
@@ -864,6 +870,50 @@ class RelayClient:
                 await self._send({"type": "socks", "to": from_id, **d})
 
             await self._socks_exit.handle_as_exit(msg, _reply)
+
+    # ── channel / group chat ────────────────────────────────────
+
+    async def send_channel_msg(self, channel_id: str, key: bytes, text: str):
+        """Encrypt text with channel key and broadcast to the channel."""
+        from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+        nonce = os.urandom(12)
+        # Include sender name in payload so receivers can display it
+        inner = json.dumps({"from": self.name, "text": text}).encode()
+        ct    = AESGCM(key).encrypt(nonce, inner, None)
+        await self._send({
+            "type":       "channel_msg",
+            "channel_id": channel_id,
+            "payload":    base64.b64encode(ct).decode(),
+            "nonce":      base64.b64encode(nonce).decode(),
+        })
+        # Store key locally so incoming messages from same channel can be decrypted
+        self._channel_keys[channel_id] = key
+
+    def register_channel_key(self, channel_id: str, key: bytes):
+        """Register a channel key so incoming messages can be decrypted."""
+        self._channel_keys[channel_id] = key
+
+    async def _handle_channel_msg(self, msg: dict):
+        """Try to decrypt an incoming channel message with known channel keys."""
+        from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+        channel_id = msg.get("channel_id", "")
+        from_name  = msg.get("from_name", "?")
+        payload_b  = msg.get("payload", "")
+        nonce_b    = msg.get("nonce", "")
+        if not payload_b or not nonce_b: return
+        key = self._channel_keys.get(channel_id)
+        if not key: return
+        try:
+            ct    = base64.b64decode(payload_b)
+            nonce = base64.b64decode(nonce_b)
+            inner = AESGCM(key).decrypt(nonce, ct, None)
+            data  = json.loads(inner.decode())
+            sender = data.get("from", from_name)
+            text   = data.get("text", "")
+            if self._on_channel_msg:
+                self._on_channel_msg(channel_id, sender, text)
+        except Exception as e:
+            log.debug("channel_msg decrypt failed cid=%s: %s", channel_id, e)
 
     async def _prefetch_pubkey(self, pid):
         await self.get_pubkey_raw(pid)

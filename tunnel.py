@@ -34,9 +34,17 @@ PCAP capture
 ServerTunnelManager can write a standard libpcap file of all routed packets.
 """
 
-import os, struct, fcntl, subprocess, logging, asyncio, base64, select, time
-import hashlib, json, socket, shutil
+import os, struct, subprocess, logging, asyncio, base64, time
+import hashlib, json, socket, shutil, platform as _platform
 from typing import Optional, Callable
+
+_IS_LINUX = _platform.system().lower() == "linux"
+
+# Linux-only low-level imports — guarded so Windows can import tunnel.py
+if _IS_LINUX:
+    import fcntl, select
+else:
+    fcntl = None; select = None
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from cryptography.hazmat.primitives.kdf.hkdf import HKDF
 from cryptography.hazmat.primitives.hashes import SHA256
@@ -54,8 +62,10 @@ PCAP_MAGIC    = 0xa1b2c3d4
 PCAP_LINKTYPE = 101
 
 def check_root():
-    if os.name != "posix":
-        raise RuntimeError("Traffic tunnel is Linux-only.")
+    if not _IS_LINUX:
+        raise RuntimeError(
+            "Traffic tunnel and PCAP require Linux.\n"
+            "SOCKS5 proxy works on all platforms without root.")
     if os.geteuid() != 0:
         raise RuntimeError("Traffic tunnel requires root.\nRun: sudo python3 tui.py")
 
@@ -69,6 +79,8 @@ def _rand_iface(prefix: str) -> str:
     return (prefix + os.urandom(3).hex())[:15]
 
 def _open_tun(name: str) -> int:
+    if not _IS_LINUX or fcntl is None:
+        raise RuntimeError("TUN devices are Linux-only")
     try:
         fd = os.open("/dev/net/tun", os.O_RDWR | os.O_NONBLOCK)
     except PermissionError:
@@ -131,6 +143,7 @@ class _AsyncTUNReader:
     def _read_one(self) -> bytes:
         if self._fd is None or self._stop:
             time.sleep(0.05); return b""
+        if select is None: time.sleep(0.1); return b""
         try:
             r, _, _ = select.select([self._fd], [], [], 0.1)
             if r: return os.read(self._fd, 65536)
@@ -326,8 +339,8 @@ class ClientTunnelManager:
       Reverse all of the above, restore resolv.conf.
     """
 
-    RESOLV_BACKUP = "/etc/resolv.conf.tun_backup"
-    RESOLV_PATH   = "/etc/resolv.conf"
+    RESOLV_BACKUP = "/etc/resolv.conf.tun_backup" if _IS_LINUX else ""
+    RESOLV_PATH   = "/etc/resolv.conf"             if _IS_LINUX else ""
 
     def __init__(self):
         self._fd          = None
