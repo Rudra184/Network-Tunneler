@@ -279,10 +279,14 @@ async def handle_client(reader, writer):
         if not verify_totp(totp_key, client_totp):
             record_fail(ip); audit("bad_totp", ip=ip); await drop(); return
 
-        name   = str(msg.get("name", peer_id))[:32]
-        pubkey = msg.get("pubkey", "")
+        name    = str(msg.get("name", peer_id))[:32]
+        pubkey  = msg.get("pubkey", "")
+        udp_port = int(msg.get("udp_port", 0))
 
-        peers[peer_id] = {"name": name, "writer": writer, "pubkey": pubkey, "ip": ip}
+        peers[peer_id] = {
+            "name": name, "writer": writer, "pubkey": pubkey, "ip": ip,
+            "udp_port": udp_port,   # 0 = no direct UDP (behind symmetric NAT)
+        }
         log.info("Auth OK  id=%-8s  name=%-15s  ip=%s", peer_id, name, ip)
         audit("registered", peer_id=peer_id, name=name, ip=ip)
 
@@ -332,6 +336,53 @@ async def handle_client(reader, writer):
                         pass
                 else:
                     await send({"type": "error", "msg": "Target not connected"})
+
+            elif t == "register_udp":
+                # Client telling us their UDP port (bound before connect)
+                udp_p = int(msg.get("udp_port", 0))
+                if 1024 <= udp_p <= 65535:
+                    peers[peer_id]["udp_port"] = udp_p
+                    log.info("P2P UDP registered: %s → %s:%d", peer_id, ip, udp_p)
+
+            elif t == "get_udp_addr":
+                # Return another peer's public (ip, udp_port)
+                tid = msg.get("peer_id", "")
+                if tid in peers and peers[tid]["udp_port"]:
+                    await send({
+                        "type":     "udp_addr",
+                        "peer_id":  tid,
+                        "addr":     f"{peers[tid]['ip']}:{peers[tid]['udp_port']}",
+                    })
+                else:
+                    await send({"type": "udp_addr", "peer_id": tid, "addr": ""})
+
+            elif t == "punch_request":
+                # Peer A wants to punch to peer B.
+                # Send punch_now to BOTH simultaneously so they fire probes at
+                # the same time — this is the "simultaneous open" coordination.
+                tid = msg.get("target_id", "")
+                if tid in peers and peers[peer_id]["udp_port"] and peers[tid]["udp_port"]:
+                    a_addr = f"{ip}:{peers[peer_id]['udp_port']}"
+                    b_addr = f"{peers[tid]['ip']}:{peers[tid]['udp_port']}"
+                    # Send to requester (A): here is B's addr
+                    writer.write(enc({
+                        "type": "punch_now",
+                        "peer_id": tid,
+                        "addr": b_addr,
+                    }))
+                    await writer.drain()
+                    # Send to target (B): here is A's addr
+                    if tid in peers:
+                        peers[tid]["writer"].write(enc({
+                            "type": "punch_now",
+                            "peer_id": peer_id,
+                            "addr": a_addr,
+                        }))
+                        try: await peers[tid]["writer"].drain()
+                        except: pass
+                    log.info("P2P punch coordinated: %s ↔ %s", peer_id, tid)
+                else:
+                    await send({"type": "punch_now", "peer_id": tid, "addr": ""})
 
             elif t == "join_channel":
                 cid = msg.get("channel_id", "")[:64]

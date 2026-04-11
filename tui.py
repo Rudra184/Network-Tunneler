@@ -1,10 +1,4 @@
 #!/usr/bin/env python3
-"""
-tui.py — Secure Tunnel TUI
-  pip install textual cryptography pillow
-  python3 tui.py
-"""
-
 import asyncio, os, sys, argparse, base64, logging, time, platform, hashlib
 from collections import defaultdict
 from urllib.parse import urlparse
@@ -237,29 +231,31 @@ class TunnelApp(App):
     #pcap-log      { height: 1fr; border: solid $panel; padding: 0 1; }
 
     /* ── Groups tab ── */
-    #grp-wrap    { height: 1fr; layout: horizontal; }
-    #grp-left    { width: 32; height: 1fr; border-right: solid $panel;
-                   padding: 1; layout: vertical; }
-    #grp-right   { width: 1fr; height: 1fr; padding: 1; layout: vertical; }
-    #grp-chan-scroll { height: 1fr; }
-    .grp-chan-btn { width: 100%; height: 3; background: transparent; border: none;
-                    text-align: left; padding: 0 1; color: $text; margin-bottom: 0; }
+    #grp-wrap        { height: 1fr; layout: horizontal; }
+    #grp-left-scroll { width: 44; height: 1fr; border-right: solid $panel; }
+    #grp-left        { width: 100%; height: auto; padding: 1; layout: vertical; }
+    #grp-right       { width: 1fr; height: 1fr; padding: 1; layout: vertical; }
+    #grp-chan-list   { height: auto; margin-top: 1; }
+    .grp-chan-btn    { width: 100%; height: 3; background: transparent; border: none;
+                      text-align: left; padding: 0 1; color: $text; margin-bottom: 0; }
     .grp-chan-btn:hover { background: $accent 20%; }
     .grp-chan-btn.-sel  { background: $accent 40%; text-style: bold; }
-    #grp-who     { height: 2; color: $text-muted; text-style: italic; }
-    #grp-log     { height: 1fr; border: solid $panel; padding: 0 1; }
-    #grp-inp-row { layout: horizontal; height: 3; margin-top: 1; }
-    #grp-inp     { width: 1fr; }
-    #btn-grp-send { width: 10; margin-left: 1; }
-    #grp-create-card  { border: solid $success; padding: 1 2;
-                        margin-bottom: 1; height: auto; }
-    #grp-action-row   { layout: horizontal; height: 3; margin-top: 1; }
-    #grp-action-row Button { width: 1fr; margin-right: 1; }
-    #grp-action-row Button:last-of-type { margin-right: 0; }
-    #grp-header-row   { layout: horizontal; height: 2; margin-bottom: 0; }
-    #grp-who          { width: 1fr; color: $text-muted; text-style: italic; }
-    .grp-leave-btn    { width: 10; height: 2; min-width: 0; }
-    #sel-theme        { height: 3; margin-top: 1; }
+    #grp-log         { height: 1fr; border: solid $panel; padding: 0 1; }
+    #grp-inp-row     { layout: horizontal; height: 3; margin-top: 1; }
+    #grp-inp         { width: 1fr; }
+    #btn-grp-send    { width: 10; margin-left: 1; }
+    #grp-create-card { border: solid $success; padding: 1 2;
+                       margin-bottom: 1; height: auto; }
+    #grp-create-card .card-title { color: $success; }
+    #grp-join-card   { border: solid $primary; padding: 1 2;
+                       margin-bottom: 1; height: auto; }
+    #grp-join-card .card-title { color: $primary; }
+    #grp-header-row  { layout: horizontal; height: 3; margin-bottom: 1;
+                       align: left middle; }
+    #grp-who         { width: 1fr; color: $text-muted; text-style: italic; }
+    .grp-leave-btn   { width: 10; }
+    #no-channels-lbl { color: $text-muted; text-style: italic; height: 2; }
+    #sel-theme       { height: 3; margin-top: 1; }
     """
 
     BINDINGS = [
@@ -532,31 +528,63 @@ class TunnelApp(App):
                 # ── F8 Groups ─────────────────────────────────────────────────
                 with TabPane("🔐 Groups", id="tab-groups"):
                     with Horizontal(id="grp-wrap"):
-                        with Vertical(id="grp-left"):
-                            yield Label("Secret Channels", classes="card-title")
-                            yield Static(
-                                "Channels are hidden — only peers with\n"
-                                "the name and password can join.",
-                                classes="muted")
-                            with Vertical(id="grp-create-card"):
-                                yield Label("Channel", classes="card-title")
-                                with Vertical(classes="field"):
-                                    yield Label("Channel name")
-                                    yield Input(placeholder="e.g. ops-alpha",
-                                                id="inp-grp-name")
-                                with Vertical(classes="field"):
-                                    yield Label("Password")
-                                    yield Input(placeholder="channel password",
-                                                id="inp-grp-pass", password=True)
-                                with Horizontal(id="grp-action-row"):
-                                    yield Button("Create", id="btn-grp-create",
+                        with ScrollableContainer(id="grp-left-scroll"):
+                            with Vertical(id="grp-left"):
+                                yield Label("Secret Channels",
+                                            classes="card-title")
+                                yield Static(
+                                    "Hidden — only peers with the name AND "
+                                    "password can access.",
+                                    classes="muted")
+
+                                with Vertical(id="grp-create-card"):
+                                    yield Label("New Channel",
+                                                classes="card-title")
+                                    yield Static(
+                                        "Start a new private channel.",
+                                        classes="desc")
+                                    with Vertical(classes="field"):
+                                        yield Label("Channel name")
+                                        yield Input(
+                                            placeholder="e.g. ops-alpha",
+                                            id="inp-create-name")
+                                    with Vertical(classes="field"):
+                                        yield Label("Password")
+                                        yield Input(
+                                            placeholder="choose a password",
+                                            id="inp-create-pass",
+                                            password=True)
+                                    yield Button("Create Channel",
+                                                 id="btn-grp-create",
                                                  variant="success")
-                                    yield Button("Join", id="btn-grp-join",
+
+                                with Vertical(id="grp-join-card"):
+                                    yield Label("Join Channel",
+                                                classes="card-title")
+                                    yield Static(
+                                        "Enter credentials from the creator.",
+                                        classes="desc")
+                                    with Vertical(classes="field"):
+                                        yield Label("Channel name")
+                                        yield Input(
+                                            placeholder="e.g. ops-alpha",
+                                            id="inp-join-name")
+                                    with Vertical(classes="field"):
+                                        yield Label("Password")
+                                        yield Input(
+                                            placeholder="enter the password",
+                                            id="inp-join-pass",
+                                            password=True)
+                                    yield Button("Join Channel",
+                                                 id="btn-grp-join",
                                                  variant="primary")
-                            yield Label("Active channels", classes="muted")
-                            with VerticalScroll(id="grp-chan-scroll"):
-                                yield Label("(none)", id="no-channels",
-                                            classes="muted")
+
+                                yield Label("Active channels", classes="muted")
+                                with Vertical(id="grp-chan-list"):
+                                    yield Label("(none)",
+                                                id="no-channels",
+                                                classes="muted")
+
                         with Vertical(id="grp-right"):
                             with Horizontal(id="grp-header-row"):
                                 yield Label("No channel selected", id="grp-who")
@@ -658,7 +686,9 @@ class TunnelApp(App):
         desired = {}
         for pid, pname in current.items():
             al = id2al.get(pid, "")
-            desired[pid] = f"  {pname}" + (f" ({al})" if al else "")
+            _direct = getattr(self._client, "_p2p_direct", set())
+            icon = "\u27f3" if pid in _direct else "\xb7"
+            desired[pid] = f" {icon} {pname}" + (f" ({al})" if al else "")
         if desired == self._shown_peers: return
         scroll = self._q("#peer-scroll", VerticalScroll)
         if not scroll: return
@@ -778,11 +808,27 @@ class TunnelApp(App):
         if e.input.id == "grp-inp":  await self._send_group_msg()
 
     def on_select_changed(self, e: Select.Changed):
-        if e.select.id == "sel-theme" and e.value:
+        try:
+            widget_id = (e.control if hasattr(e, "control") else e.select).id
+        except Exception:
+            return
+        if widget_id != "sel-theme":
+            return
+        val = e.value
+        try:
+            from textual.widgets import Select as _Sel
+            if val is _Sel.BLANK:
+                return
+        except Exception:
+            pass
+        if val and str(val) not in ("", "BLANK"):
             try:
-                self.theme = str(e.value)
+                self.app.theme = str(val)
             except Exception:
-                pass   # theme not available in this textual version — ignore
+                try:
+                    self.theme = str(val)
+                except Exception:
+                    pass
 
     # ── settings ──────────────────────────────────────────────────────────────
 
@@ -896,6 +942,11 @@ class TunnelApp(App):
         self._client._on_socks_status  = on_socks_status
         self._client._on_pcap_ack      = on_pcap_ack
         self._client._on_channel_msg   = on_channel_msg
+
+        def on_p2p_status(peer_id: str, is_direct: bool):
+            app_ref._shown_peers = {}   # force sidebar redraw on status change
+
+        self._client._on_p2p_status = on_p2p_status
 
         try:
             await self._client.connect()
@@ -1100,15 +1151,20 @@ class TunnelApp(App):
             self._stg_msg("Connect first", err=True); return
         if not name or not pw: return
         cid, key = _derive_channel(name, pw)
-        if cid not in self._channels:
-            self._channels[cid] = {"name": name, "key": key}
-            # Register key so incoming messages can be decrypted immediately
-            self._client.register_channel_key(cid, key)
-            try:
-                await self._client._send({"type": "join_channel", "channel_id": cid})
-            except Exception as e:
-                self._stg_msg(f"Channel {verb} failed: {e}", err=True)
-                del self._channels[cid]; return
+        is_new = cid not in self._channels
+        # Always register key locally so incoming messages decrypt correctly
+        self._channels[cid] = {"name": name, "key": key}
+        self._client.register_channel_key(cid, key)
+        # Always send join_channel to server — server uses its own membership
+        # set to route messages; if we don't send this the server won't relay
+        # channel messages to us even if we already have the key locally.
+        try:
+            await self._client._send({"type": "join_channel", "channel_id": cid})
+        except Exception as e:
+            self._stg_msg(f"Channel {verb} failed: {e}", err=True)
+            if is_new: del self._channels[cid]
+            return
+        if is_new:
             await self._rebuild_chan_list()
         # Switch to this channel
         self._current_channel = cid
@@ -1119,14 +1175,11 @@ class TunnelApp(App):
         if rl: rl.write(
             f"[{ts}] [green]{verb.capitalize()}d channel "
             f"[bold]{name}[/bold][/green]")
-        # Clear inputs
-        for sel in ("#inp-grp-name", "#inp-grp-pass"):
-            inp = self._q(sel, Input)
-            if inp: inp.value = ""
+        # (fields cleared by calling method)
 
     async def _create_channel(self):
-        name = self._val("#inp-grp-name").strip()
-        pw   = self._val("#inp-grp-pass").strip()
+        name = self._val("#inp-create-name").strip()
+        pw   = self._val("#inp-create-pass").strip()
         if not name:
             rl = self._q("#grp-log", RichLog)
             if rl: rl.write("[red]Enter a channel name first[/red]"); return
@@ -1134,10 +1187,13 @@ class TunnelApp(App):
             rl = self._q("#grp-log", RichLog)
             if rl: rl.write("[red]Enter a channel password first[/red]"); return
         await self._enter_channel(name, pw, "create")
+        for sel in ("#inp-create-name", "#inp-create-pass"):
+            w = self._q(sel, Input)
+            if w: w.value = ""
 
     async def _join_channel(self):
-        name = self._val("#inp-grp-name").strip()
-        pw   = self._val("#inp-grp-pass").strip()
+        name = self._val("#inp-join-name").strip()
+        pw   = self._val("#inp-join-pass").strip()
         if not name:
             rl = self._q("#grp-log", RichLog)
             if rl: rl.write("[red]Enter the channel name to join[/red]"); return
@@ -1145,6 +1201,9 @@ class TunnelApp(App):
             rl = self._q("#grp-log", RichLog)
             if rl: rl.write("[red]Enter the channel password[/red]"); return
         await self._enter_channel(name, pw, "join")
+        for sel in ("#inp-join-name", "#inp-join-pass"):
+            w = self._q(sel, Input)
+            if w: w.value = ""
 
     async def _leave_channel(self):
         cid = self._current_channel
@@ -1206,9 +1265,9 @@ class TunnelApp(App):
             f"[dim](id: {cid[:8]}…)[/dim]")
 
     async def _rebuild_chan_list(self):
-        scroll = self._q("#grp-chan-scroll", VerticalScroll)
-        if not scroll: return
-        for btn in list(scroll.query(Button)):
+        container = self._q("#grp-chan-list", Vertical)
+        if not container: return
+        for btn in list(container.query(Button)):
             if btn.id and btn.id.startswith(_CHAN_BTN_PREFIX):
                 await btn.remove()
         nc = self._q("#no-channels", Label)
@@ -1222,7 +1281,7 @@ class TunnelApp(App):
                 classes="grp-chan-btn")
             if cid == self._current_channel:
                 btn.add_class("-sel")
-            await scroll.mount(btn)
+            await container.mount(btn)
 
     def _update_chan_buttons(self):
         for btn in self.query(Button):

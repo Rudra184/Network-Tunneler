@@ -1,33 +1,5 @@
 #!/usr/bin/env python3
-"""
-client.py — Secure E2E tunnel client
-  pip install cryptography pillow
-  python3 client.py --relay <ip> --secret <key> --name <you> [options]
 
-══ STEGANOGRAPHY ══════════════════════════════════════════════════════════════
-
-  SENDER (Steg tab → ENCODE):
-    1. Enter a cover image path (JPG, PNG, BMP, TIFF, WebP …)
-    2. Choose "Hide a file" (any type) or "Hide a text message"
-    3. Enter a steg password — tell the receiver this out-of-band
-    4. Click Embed & Send
-
-  RECEIVER (Steg tab → DECODE):
-    1. Accept the incoming file popup — stego PNG is saved to:
-         <same folder as client.py>/received_steg/
-    2. Go to Steg tab → DECODE section (path is auto-filled)
-    3. Enter the steg password the sender told you
-    4. Click Decode
-       • Hidden FILE  → saved to disk, full path shown
-       • Hidden TEXT  → shown on screen in the result panel
-
-  SECURITY:
-    • Steg password is NEVER transmitted over the network
-    • AES-256-GCM key derived via PBKDF2-HMAC-SHA256 (200k iterations)
-    • Without the password, extracted LSBs are indistinguishable from noise
-
-══════════════════════════════════════════════════════════════════════════════
-"""
 
 import asyncio, json, os, sys, argparse, logging, base64, zipfile
 import struct, hmac, hashlib, ssl, time, tempfile, random, subprocess
@@ -64,6 +36,11 @@ try:
     from tunnel import ClientTunnelManager, Socks5Server
 except ImportError:
     ClientTunnelManager = None; Socks5Server = None
+
+try:
+    from peer import PeerManager
+except ImportError:
+    PeerManager = None
 
 from cryptography.hazmat.primitives.asymmetric.x25519 import X25519PrivateKey, X25519PublicKey
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
@@ -433,6 +410,12 @@ class RelayClient:
         # local channel key store: channel_id → bytes
         self._channel_keys: dict = {}
 
+        # P2P direct sessions
+        self._peer_mgr: object = None   # PeerManager when running
+        # _on_p2p_status(peer_id, is_direct: bool)
+        self._on_p2p_status = None
+        self._p2p_direct: set = set()   # peer_ids with live direct sessions
+
     def _xfer_log(self, msg: str, err: bool = False):
         """Route a status message to TUI callback or print()."""
         if self._on_xfer_status:
@@ -481,9 +464,17 @@ class RelayClient:
         if welcome.get("type") != "welcome": raise RuntimeError(f"Auth failed: {welcome}")
         self.my_id = welcome["your_id"]
         log.info("Connected  id=%s", self.my_id)
+        # Start P2P layer if available
+        if PeerManager is not None:
+            asyncio.create_task(self._start_p2p())
         self._task = asyncio.create_task(self._recv_loop())
 
     async def disconnect(self):
+        if self._peer_mgr:
+            try: await self._peer_mgr.stop()
+            except: pass
+            self._peer_mgr = None
+        self._p2p_direct.clear()
         if self._socks:
             try: await self._socks.stop()
             except: pass
@@ -656,11 +647,21 @@ class RelayClient:
         key = await self.get_shared_key(target_id)
         if key is None: return
         nonce = os.urandom(12); ct = AESGCM(key).encrypt(nonce, text.encode(), None)
-        await self._send({
+        obj = {
             "type":"msg","to":target_id,
             "payload":base64.b64encode(ct).decode(),
             "nonce":base64.b64encode(nonce).decode(),
-        })
+        }
+        # Try direct UDP; relay is fallback
+        if self._peer_mgr and target_id in self._p2p_direct:
+            import json as _json
+            direct_obj = dict(obj)
+            direct_obj["from_id"]   = self.my_id
+            direct_obj["from_name"] = self.name
+            payload = _json.dumps(direct_obj).encode()
+            if await self._peer_mgr.send(target_id, payload):
+                return
+        await self._send(obj)
 
     # ── receive loop ──────────────────────────────────────────
 
@@ -680,6 +681,9 @@ class RelayClient:
                     for pid in self.peers:
                         if pid not in self._pubkey_raw:
                             asyncio.create_task(self._prefetch_pubkey(pid))
+                        # Request direct UDP punch for new peers
+                        if self._peer_mgr and pid not in self._p2p_direct:
+                            asyncio.create_task(self._request_punch(pid))
                 elif t == "pubkey_response":
                     pid = msg["peer_id"]; rb = base64.b64decode(msg["pubkey"])
                     self._pubkey_raw[pid] = rb
@@ -733,6 +737,12 @@ class RelayClient:
                         ok   = msg.get("ok", False)
                         info = msg.get("path","") or msg.get("msg","")
                         self._on_pcap_ack(ok, info)
+                elif t == "punch_now":
+                    # Server is coordinating a simultaneous hole punch
+                    asyncio.create_task(self._handle_punch_now(msg))
+                elif t == "udp_addr":
+                    # Response to our get_udp_addr request — initiate punch
+                    asyncio.create_task(self._handle_udp_addr(msg))
                 elif t == "channel_msg":
                     asyncio.create_task(self._handle_channel_msg(msg))
         except (asyncio.IncompleteReadError, ConnectionResetError, BrokenPipeError):
@@ -871,7 +881,105 @@ class RelayClient:
 
             await self._socks_exit.handle_as_exit(msg, _reply)
 
-    # ── channel / group chat ────────────────────────────────────
+    # ── P2P direct sessions ─────────────────────────────────────
+
+    async def _start_p2p(self):
+        """Start UDP socket, register with relay, request punches for known peers."""
+        if PeerManager is None or not self.writer:
+            return
+        try:
+            mgr = PeerManager()
+
+            def _on_msg(peer_id: str, payload: bytes):
+                """Called by PeerManager when a direct UDP message arrives."""
+                try:
+                    import json as _json
+                    msg = _json.loads(payload.decode())
+                    asyncio.ensure_future(self._dispatch_direct_msg(peer_id, msg))
+                except Exception as e:
+                    log.warning("P2P msg parse error from %s: %s", peer_id, e)
+
+            def _on_status(peer_id: str, is_direct: bool):
+                if is_direct:
+                    self._p2p_direct.add(peer_id)
+                else:
+                    self._p2p_direct.discard(peer_id)
+                if self._on_p2p_status:
+                    self._on_p2p_status(peer_id, is_direct)
+
+            mgr.on_message = _on_msg
+            mgr.on_status  = _on_status
+            port = await mgr.start(self.my_id or "?")
+            self._peer_mgr = mgr
+            if port == 0:
+                # UDP not available on this platform (e.g. old Windows build)
+                # All traffic will use the relay — no P2P, no error.
+                log.info("P2P UDP unavailable — relay-only mode")
+                return
+            # Register our UDP port with the relay server
+            await self._send({"type": "register_udp", "udp_port": port})
+            log.info("P2P ready on UDP port %d", port)
+            # Request punches for all already-known peers
+            for pid in list(self.peers):
+                await self._request_punch(pid)
+        except Exception as e:
+            log.warning("P2P init failed: %s", e)
+
+    async def _request_punch(self, peer_id: str):
+        """Ask server to coordinate hole punch with this peer."""
+        if not self._peer_mgr or not self.writer:
+            return
+        if self._peer_mgr.has_session(peer_id):
+            return
+        try:
+            await self._send({"type": "punch_request", "target_id": peer_id})
+        except Exception:
+            pass
+
+    async def _handle_punch_now(self, msg: dict):
+        """Server says: punch peer_id at addr right now."""
+        if not self._peer_mgr:
+            return
+        peer_id  = msg.get("peer_id", "")
+        addr_str = msg.get("addr", "")
+        if peer_id and addr_str:
+            await self._peer_mgr.punch(peer_id, addr_str)
+
+    async def _handle_udp_addr(self, msg: dict):
+        """Got a peer's UDP address — initiate punch."""
+        if not self._peer_mgr:
+            return
+        peer_id  = msg.get("peer_id", "")
+        addr_str = msg.get("addr", "")
+        if peer_id and addr_str:
+            await self._peer_mgr.punch(peer_id, addr_str)
+
+    async def _dispatch_direct_msg(self, peer_id: str, msg: dict):
+        """Route a message that arrived over direct UDP."""
+        t = msg.get("type")
+        if t == "msg":
+            # Reconstruct with from_id/from_name so _receive_message works
+            if "from_id" not in msg:
+                msg["from_id"]   = peer_id
+                msg["from_name"] = self.peers.get(peer_id, peer_id)
+            await self._receive_message(msg)
+        elif t == "channel_msg":
+            asyncio.create_task(self._handle_channel_msg(msg))
+        elif t == "socks":
+            asyncio.create_task(self._handle_socks_msg(msg))
+
+    async def _send_direct_or_relay(self, peer_id: str, obj: dict) -> bool:
+        """Try direct UDP first; fall back to TLS relay. Returns True if direct."""
+        if self._peer_mgr and peer_id in self._p2p_direct:
+            import json as _json
+            payload = _json.dumps(obj).encode()
+            if await self._peer_mgr.send(peer_id, payload):
+                return True
+        # Relay fallback
+        await self._send(obj)
+        return False
+
+    # ── channel / group chat ─────────────────────────────────────
 
     async def send_channel_msg(self, channel_id: str, key: bytes, text: str):
         """Encrypt text with channel key and broadcast to the channel."""
